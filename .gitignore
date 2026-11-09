@@ -1,0 +1,25 @@
+# ---- OS / editor ----
+.DS_Store
+*.swp
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- KiCad: local history (has its own nested .git), autosave, temp ----
+.history/
+*-backups/
+fp-info-cache
+*.lck
+
+# ---- KiCad generated fab output ----
+# Regenerable from the .kicad_pcb / .kicad_sch source. Tracked in the first
+# commit for now; uncomment to keep generated output out of the repo:
+# hardware/*.gbr
+# hardware/*.gbrjob
+# hardware/*.csv
+# hardware/*.drl
+# hardware/jlcpcb/
+# hardware/kwikset-913-debug.zip

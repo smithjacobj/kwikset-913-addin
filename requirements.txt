@@ -1,0 +1,3 @@
+# Bench harness runtime deps (Python 3.x).
+# Only pyserial is external; the rest is stdlib (argparse, sys, struct, time).
+pyserial>=3.5
