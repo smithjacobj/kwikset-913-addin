@@ -218,18 +218,45 @@ def open_port(path, baud=9600, swap=False):
     return s
 
 # Frames to SEND as the module during emulate (from captured module TX, direction-agnostic).
-# Checks are now computed by build_frame() against the confirmed CRC model.
-# Seq values are carried from the capture (boot handshake is byte-identical every power-on).
+# Checks are computed by build_frame() against the confirmed CRC model.
 HELO = build_frame(0x01, 0xAA, 0x18, [0x00])  # hello: seq01 roleAA cmd18 data00 -> check 0x49
-# responses keyed by (role,cmd) we observed the module answering:
+
+# Response TEMPLATES, keyed by the (role,cmd) of the incoming MCU request we are
+# answering. Each value is (reply_role, reply_cmd, reply_data). The SEQ is NOT
+# stored here — it is assigned dynamically at send time by make_reply(), so
+# repeated polls get distinct, fresh SEQs instead of one frozen boot-era value.
+# (reply role is 0xAA — module response — for all of these.)
 RESPS = {
-    (0xE7, 0x02): build_frame(0x03, 0xAA, 0x02, [0x04, 0x00, 0x36, 0x0D]),  # id/cap blob -> 63
-    (0xE7, 0x07): build_frame(0x04, 0xAA, 0x07, [0x00]),                    # -> 53
-    (0xE7, 0x08): build_frame(0x05, 0xAA, 0x08, [0x00]),                    # -> 5D
-    (0xE7, 0x09): build_frame(0x06, 0xAA, 0x25, []),                        # 25 status -> 72
-    (0xE7, 0x35): build_frame(0x07, 0xAA, 0x35, [0x20]*16),                 # config 16x20 -> 73
-    (0xE7, 0x30): build_frame(0x08, 0xAA, 0x30, [0x01]),                    # -> 69
+    (0xE7, 0x02): (0xAA, 0x02, [0x04, 0x00, 0x36, 0x0D]),  # id/cap blob
+    (0xE7, 0x07): (0xAA, 0x07, [0x00]),
+    (0xE7, 0x08): (0xAA, 0x08, [0x00]),
+    (0xE7, 0x09): (0xAA, 0x25, []),   # NOTE: replies to a cmd09 request with a cmd25
+                                      # frame. Kept exactly as-captured — but primer boot
+                                      # step 5 says the reply should be cmd09 data5A, and
+                                      # the steady-state cmd25 poll is NOT covered at all
+                                      # (no (0xE7,0x25) key). See make_reply / TODO below.
+    (0xE7, 0x35): (0xAA, 0x35, [0x20]*16),                # config 16x20
+    (0xE7, 0x30): (0xAA, 0x30, [0x01]),
 }
+
+def make_reply(req, seq=None):
+    """Build the reply frame for an incoming request frame `req` (a split dict),
+    or None if we have no response for it.
+
+    SEQ is DYNAMIC: by default it ECHOES the request's own SEQ (reply_seq ==
+    req_seq). This matches the capture — the steady-state 0x25 polls arrive at
+    seq 09/0A/0B... and the module's status replies mirror them at 09/0A/0B... —
+    and it eliminates the old frozen boot-era SEQ that made repeated replies
+    duplicates. Pass seq= to override (e.g. a fixed value for an A/B test).
+    """
+    r_role, r_cmd = req["fields"][2], req["fields"][3]     # (role,cmd) of the request
+    tpl = RESPS.get((r_role, r_cmd))
+    if tpl is None:
+        return None
+    reply_role, reply_cmd, reply_data = tpl
+    if seq is None:
+        seq = req["fields"][1]                             # echo the request SEQ
+    return build_frame(seq, reply_role, reply_cmd, reply_data)
 
 # Actuation cluster — the frames the MODULE (us) sends to trigger lock/unlock.
 # Reconstructed from capture 3's "Module TX (we send)" actuation frames
@@ -284,8 +311,7 @@ def emulate(s, seconds=30):
         f = log_frame("<-", b)          # verbose-aware log; returns split dict or None
         if not f:
             continue
-        key = (f["fields"][2], f["fields"][3])
-        resp = RESPS.get(key)
+        resp = make_reply(f)            # dynamic-SEQ reply (echoes the request SEQ)
         if resp:
             tx(s, resp, "answered %02X" % f["fields"][3])
 
@@ -327,9 +353,9 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track"):
             f = log_frame("<-", b)          # verbose-aware log; returns split dict or None
             if f:
                 max_seq = max(max_seq, f["fields"][1])     # fields[1] = SEQ
-                key = (f["fields"][2], f["fields"][3])
-                if key in RESPS:
-                    tx(s, RESPS[key], "answered %02X" % f["fields"][3])
+                resp = make_reply(f)                       # dynamic-SEQ reply (echo)
+                if resp:
+                    tx(s, resp, "answered %02X" % f["fields"][3])
         if not injected and time.time() >= settle_at:
             _inject(s, mode, seqmode, max_seq)
             injected = True
