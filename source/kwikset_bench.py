@@ -232,9 +232,15 @@ RESPS = {
     (0xE7, 0x08): (0xAA, 0x08, [0x00]),
     (0xE7, 0x09): (0xAA, 0x25, []),   # NOTE: replies to a cmd09 request with a cmd25
                                       # frame. Kept exactly as-captured — but primer boot
-                                      # step 5 says the reply should be cmd09 data5A, and
-                                      # the steady-state cmd25 poll is NOT covered at all
-                                      # (no (0xE7,0x25) key). See make_reply / TODO below.
+                                      # step 5 says the reply should be cmd09 data5A.
+                                      # (Open question, left exactly as-captured.)
+    (0xE7, 0x25): (0xAA, 0x25, []),   # steady-state poll: empty-data ack. Verified
+                                      # byte-exact vs capture-3 Module-TX lines 104-106:
+                                      # LEN=4 counts SEQ,ROLE,CMD,CHECK only, so 7D/7E/7F
+                                      # is the CHECK byte shifting with the echoed SEQ,
+                                      # not a "running status counter" data byte. A real
+                                      # locked/unlocked status byte would need an
+                                      # assembled-lock capture to justify adding one.
     (0xE7, 0x35): (0xAA, 0x35, [0x20]*16),                # config 16x20
     (0xE7, 0x30): (0xAA, 0x30, [0x01]),
 }
