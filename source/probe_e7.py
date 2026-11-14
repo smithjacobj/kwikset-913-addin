@@ -17,15 +17,22 @@ BACKGROUND
 
 WHAT THIS PROBE DOES
   1. waits for the MCU's hello + cmd09 prefix,
-  2. answers with role=E7 requests (default: just readID cmd02; --full sends
-     the whole module request sequence from the capture),
+  2. answers with requests in a configurable ROLE byte (--role, default E7;
+     default: just readID cmd02; --full sends the whole module request
+     sequence from the capture),
   3. watches the MCU's reaction and reports whether it progressed past the
      hello/cmd09 retry loop.
+
+  Run with --role E7 and then --role AA (and 55) to A/B the role-direction
+  question: whichever role makes the 913 progress past its retry loop is the
+  role it expects from the module. (Only meaningful once the 913 RX is
+  ungated — see the module-present / enable pin.)
 
 USAGE  (run from source/, same dir as kwikset_bench.py)
   ../.venv/bin/python probe_e7.py -p /dev/tty.usbserial-XXXX -v
   ../.venv/bin/python probe_e7.py -p /dev/tty.usbserial-XXXX -v --full
   ../.venv/bin/python probe_e7.py -p /dev/tty.usbserial-XXXX -v --after hello
+  ../.venv/bin/python probe_e7.py -p /dev/tty.usbserial-XXXX -v --role AA
 """
 import argparse, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +68,9 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--full", action="store_true",
                     help="send the full module request sequence, not just readID")
+    ap.add_argument("--role", default="E7",
+                    help="ROLE byte of the frames WE send (default E7; pass AA or 55 "
+                         "to A/B the role-direction question once the 913 RX is ungated)")
     ap.add_argument("--after", choices=["cmd09", "hello"], default="cmd09",
                     help="fire the answer after the MCU's %s "
                          "(cmd09 = end of prefix [default]; hello = after frame one)")
@@ -72,10 +82,15 @@ def main():
 
     kb.VERBOSE = a.verbose
     reqs = FULL_REQS if a.full else MIN_REQS
+    try:
+        send_role = int(a.role, 16)
+    except ValueError:
+        ap.error("--role must be hex, e.g. E7 / AA / 55")
+    rname = a.role.upper()
 
     s = kb.open_port(a.port, swap=a.swap)
-    print("Role=E7 response probe (role-reversal A/B).")
-    print("  answer = role=E7 [" + ", ".join("cmd%02X" % c for c, _ in reqs) + "]")
+    print("Response-role probe (A/B for the role-direction question).")
+    print("  answer = role=%s [" % rname + ", ".join("cmd%02X" % c for c, _ in reqs) + "]")
     print("  fire after MCU's: " + a.after)
     print("  watching for the 913 to STOP its hello/cmd09 retry loop.\n")
 
@@ -88,10 +103,10 @@ def main():
 
     def fire():
         nonlocal answered, seq
-        print("\n>>> MCU prefix complete -> answering with role=E7:")
+        print("\n>>> MCU prefix complete -> answering with role=%s:" % rname)
         for rcmd, rd in reqs:
-            kb.tx(s, kb.build_frame(seq, 0xE7, rcmd, rd),
-                  "E7 cmd%02X %s seq=%02X" % (rcmd,
+            kb.tx(s, kb.build_frame(seq, send_role, rcmd, rd),
+                  "%s cmd%02X %s seq=%02X" % (rname, rcmd,
                                               " ".join("%02X" % x for x in rd) or "-",
                                               seq))
             seq = (seq + 1) & 0xFF
