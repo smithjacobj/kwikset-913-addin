@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Kwikset 913/914 <-> Z-Wave Module UART bench harness (emulates the module)."""
+"""Kwikset 913/914 <-> Z-Wave Module UART bench harness (emulates the module).
+
+CORRECTED DIRECTION (Nov 2026 rebuild): the 913 INITIATES. It transmits the boot
+hello (role AA, cmd18) and, left unanswered, re-sends a hello+cmd09 retry prefix
+every ~2.6 s. We (the module) answer by transmitting role=E7 requests; the 913
+replies to each (role AA/55), echoing our request SEQ. See the PROTOCOL MODEL
+section below for the full corrected role model."""
 import argparse, sys, struct, time
 
 # ---------- CRC-8 (parametric, reflected/non-reflected) ----------
@@ -217,75 +223,153 @@ def open_port(path, baud=9600, swap=False):
     s.flushInput(); s.flushOutput()
     return s
 
-# Frames to SEND as the module during emulate (from captured module TX, direction-agnostic).
-# Checks are computed by build_frame() against the confirmed CRC model.
-HELO = build_frame(0x01, 0xAA, 0x18, [0x00])  # hello: seq01 roleAA cmd18 data00 -> check 0x49
+# =====================================================================
+# PROTOCOL MODEL — CORRECTED DIRECTION  (rebuild, Nov 2026)
+# =====================================================================
+# The primer's role model had EVERY direction flipped. Settled on this board
+# by a live A/B (probe_e7.py): the 913 answers our role=E7 frames and ignores
+# our role=AA frames. So the role byte marks direction, not just type:
+#
+#   ROLE  0xE7   module -> MCU   (requests)        <- WE transmit these
+#   ROLE  0xAA   MCU -> module   (responses)       <- the 913 transmits these
+#   ROLE  0x55   MCU -> module   (cmd / async)     <- the 913 transmits these
+#
+# Handshake (corrected): the MCU INITIATES. It transmits the hello (AA cmd18)
+# and, left unanswered, re-sends a hello+cmd09 retry prefix every ~2.6 s (SEQ
+# resets to 01 each retry). The module (us) answers by transmitting its request
+# sequence (E7); the 913 replies to each request (AA/55), echoing our request's
+# SEQ. Steady state: we periodically send cmd25 (E7, a status report); the 913
+# acks it (AA, empty data — the varying byte is the SEQ-dependent CHECK, not a
+# data byte).
+#
+# NOTE: this board is a DIFFERENT REVISION than start-unlock-lock.csv — same
+# command set + SEQ-echo, but board-specific payloads (see EXPECTED below). The
+# CSV's old hardcoded values (id 04 00 36 0D, cmd09 5A, cmd30 01/AA, cmd35
+# 16x20) do NOT match this board and are gone.
+# =====================================================================
+ROLE_MOD    = 0xE7   # module -> MCU : requests (what WE send)
+ROLE_MCU_AX = 0xAA   # MCU -> module : responses to our requests
+ROLE_MCU_CMD= 0x55   # MCU -> module : initiated commands / async events
 
-# Response TEMPLATES, keyed by the (role,cmd) of the incoming MCU request we are
-# answering. Each value is (reply_role, reply_cmd, reply_data). The SEQ is NOT
-# stored here — it is assigned dynamically at send time by make_reply(), so
-# repeated polls get distinct, fresh SEQs instead of one frozen boot-era value.
-# (reply role is 0xAA — module response — for all of these.)
-RESPS = {
-    (0xE7, 0x02): (0xAA, 0x02, [0x04, 0x00, 0x36, 0x0D]),  # id/cap blob
-    (0xE7, 0x07): (0xAA, 0x07, [0x00]),
-    (0xE7, 0x08): (0xAA, 0x08, [0x00]),
-    (0xE7, 0x09): (0xAA, 0x25, []),   # NOTE: replies to a cmd09 request with a cmd25
-                                      # frame. Kept exactly as-captured — but primer boot
-                                      # step 5 says the reply should be cmd09 data5A.
-                                      # (Open question, left exactly as-captured.)
-    (0xE7, 0x25): (0xAA, 0x25, []),   # steady-state poll: empty-data ack. Verified
-                                      # byte-exact vs capture-3 Module-TX lines 104-106:
-                                      # LEN=4 counts SEQ,ROLE,CMD,CHECK only, so 7D/7E/7F
-                                      # is the CHECK byte shifting with the echoed SEQ,
-                                      # not a "running status counter" data byte. A real
-                                      # locked/unlocked status byte would need an
-                                      # assembled-lock capture to justify adding one.
-    (0xE7, 0x35): (0xAA, 0x35, [0x20]*16),                # config 16x20
-    (0xE7, 0x30): (0xAA, 0x30, [0x01]),
+# The MCU's boot hello — our sync point. (role, cmd, data)
+MCU_HELLO = (0xAA, 0x18, [0x00])
+
+# Our request sequence (all role=E7), sent once at handshake. (cmd, data)
+REQS = [
+    (0x02, []),               # readID
+    (0x07, []),
+    (0x08, []),
+    (0x09, []),
+    (0x35, []),               # config — this board: no reply
+    (0x30, []),
+]
+# Steady-state poll, sent periodically. (cmd, data) — a module status report.
+STEADY_REQ = (0x25, [0x27, 0x00])
+
+# Expected 913 replies for THIS board, keyed by our request cmd: (role, data).
+# Validation/logging only — the 913 sends these, we don't. (No 0x35 entry: this
+# board does not reply to the config request.)
+EXPECTED = {
+    0x02: (0xAA, [0x08, 0x00, 0x45, 0x01]),  # ID/cap blob (board-specific)
+    0x07: (0xAA, [0x02]),
+    0x08: (0xAA, [0x00]),
+    0x09: (0xAA, [0x46]),
+    0x30: (0x55, [0x03]),
+    0x25: (0xAA, []),
 }
 
-def make_reply(req, seq=None):
-    """Build the reply frame for an incoming request frame `req` (a split dict),
-    or None if we have no response for it.
+def _d(data):
+    return " ".join("%02X" % x for x in data) or "-"
 
-    SEQ is DYNAMIC: by default it ECHOES the request's own SEQ (reply_seq ==
-    req_seq). This matches the capture — the steady-state 0x25 polls arrive at
-    seq 09/0A/0B... and the module's status replies mirror them at 09/0A/0B... —
-    and it eliminates the old frozen boot-era SEQ that made repeated replies
-    duplicates. Pass seq= to override (e.g. a fixed value for an A/B test).
-    """
-    r_role, r_cmd = req["fields"][2], req["fields"][3]     # (role,cmd) of the request
-    tpl = RESPS.get((r_role, r_cmd))
-    if tpl is None:
+def send_reqs(s, seq):
+    """Transmit our module request sequence (all role=E7). Returns next free SEQ."""
+    for cmd, data in REQS:
+        tx(s, build_frame(seq, ROLE_MOD, cmd, data),
+           "req cmd%02X %s seq=%02X" % (cmd, _d(data), seq))
+        seq = (seq + 1) & 0xFF
+    return seq
+
+# =====================================================================
+# HANDSHAKE + VALIDATION  (corrected direction)
+# =====================================================================
+# The MCU initiates; we answer with E7 requests; it replies (AA/55) echoing our
+# SEQ. These helpers implement exactly that flow. (They replace the old
+# backwards RESPS/make_reply model, where WE answered the MCU's requests.)
+
+def _check_expected(f):
+    """Validate an incoming 913 frame against this board's expected reply.
+    Silent on a match; one warning line if role or data differ from EXPECTED."""
+    exp = EXPECTED.get(f["fields"][3])
+    if exp is None:
+        return
+    e_role, e_data = exp
+    role, data = f["fields"][2], f["fields"][4:]
+    if role != e_role or data != e_data:
+        print("      ^^ MISMATCH cmd%02X: want role=%02X data=%s, got role=%02X data=%s"
+              % (f["fields"][3], e_role, _d(e_data), role, _d(data)))
+
+def _wait_prefix(s, timeout=15.0, after="cmd09"):
+    """Wait for the 913's boot prefix. The MCU INITIATES: it transmits the hello
+    (AA cmd18), then a cmd09 retry frame, and re-sends the pair every ~2.6 s
+    (SEQ resets to 01) until it gets a valid module answer. Returns True when
+    the requested sync point (`after`: 'hello' or 'cmd09') is seen within
+    `timeout`. Every frame is logged (verbose-aware) as it arrives."""
+    saw = {"hello": False, "cmd09": False}
+    start = time.time()
+    while time.time() - start < timeout:
+        b = recv_frame(s, timeout=1.0)
+        if not b:
+            continue
+        f = log_frame("<-", b)
+        if not f:
+            continue
+        role, cmd = f["fields"][2], f["fields"][3]
+        if role == ROLE_MCU_AX and cmd == 0x18:
+            saw["hello"] = True
+        if role == ROLE_MCU_AX and cmd == 0x09:
+            saw["cmd09"] = True
+        if (after == "hello" and saw["hello"]) or \
+           (after == "cmd09" and saw["hello"] and saw["cmd09"]):
+            return True
+    return False
+
+def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
+    """Corrected handshake: wait for the MCU's prefix, then transmit our E7
+    request sequence. Returns the next free SEQ, or None if no prefix was seen
+    (e.g. the enable pin is not driven High)."""
+    want = "hello" if after == "hello" else "hello+cmd09"
+    print("Waiting for the 913's boot prefix (%s)..." % want)
+    if not _wait_prefix(s, timeout=hello_timeout, after=after):
+        print("No prefix in %.0fs. Is the enable pin tied High and the 913 power-cycled?" % hello_timeout)
         return None
-    reply_role, reply_cmd, reply_data = tpl
-    if seq is None:
-        seq = req["fields"][1]                             # echo the request SEQ
-    return build_frame(seq, reply_role, reply_cmd, reply_data)
+    print("Prefix seen -> transmitting our E7 request sequence.")
+    return send_reqs(s, 0x01)     # 913 echoes our SEQ in replies (match probe_e7.py)
 
-# Actuation cluster — the frames the MODULE (us) sends to trigger lock/unlock.
-# Reconstructed from capture 3's "Module TX (we send)" actuation frames
-# (primer known-good lines 107-113). Each entry: (role, cmd, data, capture_seq).
-# CHECK bytes are computed by build_frame() against the confirmed CRC model.
+# =====================================================================
+# ACTUATION CLUSTER  (OPEN PROBLEM — live test pending)
+# =====================================================================
+# These are the actuation frames from the CSV capture. DIRECTION UNDER THE
+# CORRECTED ROLE MODEL IS AMBIGUOUS and NOT yet validated:
+#   * The old model read them as "module (us) TX". But the CSV actually places
+#     the actuation frames on the MCU->module wire, so with corrected roles the
+#     MCU likely INITIATES the actuation (pushes it to the module) — the module
+#     may not command lock/unlock directly.
+#   * The role bytes below (E7/55/AA mix) are as-captured; under the corrected
+#     model the MCU only ever transmits AA/55, so a mixed-role "module TX"
+#     cluster is internally inconsistent with the confirmed direction.
+# Treat this as ONE testable variant for the live actuation test (next step):
+# fire it after the corrected handshake and watch for a beep / 0x25 status flip.
+# CHECK bytes are computed by build_frame(); SEQ is assigned at run time.
 #
-# CAUTION — ORDER, ROLES and SEQ are HYPOTHESES, not ground truth:
-#   * Role semantics (E7/AA/55) are a working model, not proven (primer Q4).
-#   * Lock vs unlock appear to use the SAME frames (primer Q2); a real
-#     assembled-lock capture is still needed to see the 0x25 status flip.
-#   * The capture SEQs (4th field) are non-monotonic — they're what the module
-#     happened to send in that one trace, so treat them as ONE testable variant,
-#     not a rule. Use --seq to switch the assignment strategy at run time.
-# Interleaved with these, the MCU sends cmd4E/05/07/03/07 (role E7) — see the
-# primer's "MCU RX (we receive)" actuation frames.
+# Each entry: (role, cmd, data, capture_seq).
 ACT_CLUSTER = [
-    (0xE7, 0x09, [0x5A], 0x02),  # req  cmd09 data5A   (capture check 4C)
-    (0x55, 0x4E, [0x04], 0x0C),  # cmd  cmd4E data04   (capture check E9) <- the trigger
-    (0xAA, 0x07, [0x00], 0x0E),  # resp cmd07 data00   (capture check 59)
-    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14   (capture check 92)
-    (0xAA, 0x03, [],     0x0F),  # resp cmd03         (capture check 5D)
-    (0x55, 0x2A, [0x14], 0x04),  # cmd  cmd2A data14 (repeat) (capture check 95)
-    (0xAA, 0x03, [],     0x0F),  # resp cmd03         (repeat) (capture check 5D)
+    (0xE7, 0x09, [0x5A], 0x02),  # req  cmd09 data5A
+    (0x55, 0x4E, [0x04], 0x0C),  # cmd  cmd4E data04  <- the trigger
+    (0xAA, 0x07, [0x00], 0x0E),  # resp cmd07 data00
+    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14
+    (0xAA, 0x03, [],     0x0F),  # resp cmd03
+    (0x55, 0x2A, [0x14], 0x04),  # cmd  cmd2A data14 (repeat)
+    (0xAA, 0x03, [],     0x0F),  # resp cmd03 (repeat)
 ]
 
 def recv_frame(s, timeout=2.0):
@@ -306,25 +390,32 @@ def recv_frame(s, timeout=2.0):
                 return list(buf[:need])
     return list(buf) if buf and buf[0]==0xBD else None
 
-def emulate(s, seconds=30):
-    print("As the Z-Wave Module: sending hello, then answering MCU for %ds. Ctrl-C to stop." % seconds)
-    tx(s, HELO, "hello")
+def emulate(s, seconds=30, hello_timeout=15.0, after="cmd09", poll_every=2.0):
+    print("Emulate (corrected direction): wait for the 913's prefix, send our E7 "
+          "request sequence, then log its replies and send periodic cmd25 status "
+          "reports for %ds. Ctrl-C to stop." % seconds)
+    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
+    if seq is None:
+        return
     end = time.time() + seconds
+    last_poll = 0.0
     while time.time() < end:
-        b = recv_frame(s, timeout=1.5)
-        if not b:
-            continue
-        f = log_frame("<-", b)          # verbose-aware log; returns split dict or None
-        if not f:
-            continue
-        resp = make_reply(f)            # dynamic-SEQ reply (echoes the request SEQ)
-        if resp:
-            tx(s, resp, "answered %02X" % f["fields"][3])
+        b = recv_frame(s, timeout=1.0)
+        if b:
+            f = log_frame("<-", b)
+            if f:
+                _check_expected(f)
+        if poll_every and time.time() - last_poll >= poll_every:
+            rcmd, rd = STEADY_REQ
+            tx(s, build_frame(seq, ROLE_MOD, rcmd, rd),
+               "status cmd25 %s seq=%02X" % (_d(rd), seq))
+            seq = (seq + 1) & 0xFF
+            last_poll = time.time()
 
 def _next_seq(seqmode, base, i, capseq):
     """Assign the SEQ for cluster frame i.
       'track'   -> base+1+i : next-available after the highest SEQ seen from the MCU.
-                    This is the fix for the stale 0x0C injection (primer gotcha #7).
+                     This is the fix for the stale 0x0C injection (primer gotcha #7).
       'capture' -> capseq    : exact SEQ from capture 3, to reproduce it byte-for-byte.
       'zero'    -> 0x00      : probe whether the MCU checks SEQ at all.
     """
@@ -346,9 +437,16 @@ def _inject(s, mode, seqmode, base):
         d = ' '.join('%02X' % x for x in data) or "-"
         tx(s, build_frame(q, role, cmd, data), "INJECT %02X %s seq=%02X" % (cmd, d, q))
 
-def act(s, seconds=30, settle=8, mode="cluster", seqmode="track"):
-    print("Handshake, then inject %s after %ds settle (seq=%s). Ctrl-C to stop." % (mode, settle, seqmode))
-    tx(s, HELO, "hello")
+def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
+        hello_timeout=15.0, after="cmd09"):
+    print("Act (corrected direction): handshake, then inject %s after %ds settle "
+          "(seq=%s). Ctrl-C to stop." % (mode, settle, seqmode))
+    print("  NOTE: actuation direction is an OPEN PROBLEM — the ACT_CLUSTER role")
+    print("  bytes are as-captured and unvalidated under the corrected model;")
+    print("  watch for a beep / 0x25 status flip to learn who actually triggers it.")
+    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
+    if seq is None:
+        return
     end = time.time() + seconds
     settle_at = time.time() + settle
     injected = False
@@ -356,12 +454,10 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track"):
     while time.time() < end:
         b = recv_frame(s, timeout=1.5)
         if b:
-            f = log_frame("<-", b)          # verbose-aware log; returns split dict or None
+            f = log_frame("<-", b)
             if f:
                 max_seq = max(max_seq, f["fields"][1])     # fields[1] = SEQ
-                resp = make_reply(f)                       # dynamic-SEQ reply (echo)
-                if resp:
-                    tx(s, resp, "answered %02X" % f["fields"][3])
+                _check_expected(f)
         if not injected and time.time() >= settle_at:
             _inject(s, mode, seqmode, max_seq)
             injected = True
@@ -389,7 +485,15 @@ def main():
         p.add_argument("--seconds",type=int,default=30)
         p.add_argument("-v","--verbose",action="store_true",
                        help="log every frame: timestamp + CRC ok/BAD (+ raw unframed bytes)")
+        p.add_argument("--after",choices=["hello","cmd09"],default="cmd09",
+                       help="handshake sync point: 'cmd09' = after the full prefix [default]; "
+                            "'hello' = after frame one")
+        p.add_argument("--hello-timeout",type=int,default=15,
+                       help="seconds to wait for the 913's boot prefix before giving up")
         parsers[m] = p
+    pemu = parsers["emulate"]
+    pemu.add_argument("--poll",type=float,default=2.0,
+                      help="seconds between periodic cmd25 status reports (0 = disable)")
     pact = parsers["act"]
     pact.add_argument("--settle",type=int,default=8,help="seconds of handshake before injecting")
     pact.add_argument("--mode",choices=["cluster","single"],default="cluster",
@@ -416,8 +520,8 @@ def main():
         s = open_port(a.port, swap=a.swap)
         try:
             if a.cmd=="sniff": sniff(s, a.seconds)
-            elif a.cmd=="emulate": emulate(s, a.seconds)
-            elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq)
+            elif a.cmd=="emulate": emulate(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll_every=a.poll)
+            elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after)
         except KeyboardInterrupt:
             print("\nstopped")
         s.close()
