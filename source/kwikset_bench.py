@@ -6,7 +6,7 @@ hello (role AA, cmd18) and, left unanswered, re-sends a hello+cmd09 retry prefix
 every ~2.6 s. We (the module) answer by transmitting role=E7 requests; the 913
 replies to each (role AA/55), echoing our request SEQ. See the PROTOCOL MODEL
 section below for the full corrected role model."""
-import argparse, sys, struct, time
+import argparse, sys, os, struct, time
 
 # ---------- CRC-8 (parametric, reflected/non-reflected) ----------
 def crc8(data, poly, init=0x00, reflected=False, xorout=0x00):
@@ -530,6 +530,31 @@ def sniff(s, seconds=30):
         if b:
             log_frame("<-", b)
 
+class Tee:
+    """Write to both the live console stream and a log file. The console stream
+    keeps its own line-buffering, so output stays live; the file is flushed on
+    every write so a second viewer sees it immediately."""
+    def __init__(self, stream, fileobj):
+        self.stream = stream
+        self.fileobj = fileobj
+    def write(self, data):
+        self.stream.write(data)
+        self.fileobj.write(data)
+        self.fileobj.flush()
+    def flush(self):
+        self.stream.flush()
+        self.fileobj.flush()
+    def isatty(self):
+        return self.stream.isatty()
+    def fileno(self):
+        return self.stream.fileno()
+
+def _install_tee(path):
+    """Tee stdout+stderr to `path` in addition to the console."""
+    fobj = open(path, "w")
+    sys.stdout = Tee(sys.__stdout__, fobj)
+    sys.stderr = Tee(sys.__stderr__, fobj)
+
 def main():
     global VERBOSE
     ap = argparse.ArgumentParser()
@@ -549,6 +574,9 @@ def main():
                             "'hello' = after frame one")
         p.add_argument("--hello-timeout",type=int,default=15,
                        help="seconds to wait for the 913's boot prefix before giving up")
+        p.add_argument("--log",nargs="?",const="auto",default=None,metavar="FILE",
+                       help="tee all output to a log file: bare --log = logs/<mode>_TIMESTAMP.log, "
+                            "--log FILE = explicit path")
         parsers[m] = p
     pemu = parsers["emulate"]
     pemu.add_argument("--poll",type=float,default=2.0,
@@ -565,6 +593,13 @@ def main():
     pact.add_argument("--poll",type=float,default=2.0,
                       help="seconds between periodic cmd25 status reports during the test (0 = quiet baseline)")
     a = ap.parse_args()
+    if getattr(a, "log", None):
+        logpath = a.log
+        if logpath == "auto":
+            os.makedirs("logs", exist_ok=True)
+            logpath = "logs/%s_%s.log" % (a.cmd, time.strftime("%Y%m%d_%H%M%S"))
+        _install_tee(logpath)
+        print("Logging to %s" % logpath)
 
     if a.cmd == "calibrate":
         frames = {}
