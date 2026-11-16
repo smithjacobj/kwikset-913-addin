@@ -425,42 +425,101 @@ def _next_seq(seqmode, base, i, capseq):
         return 0x00
     return (base + 1 + i) & 0xFF
 
-def _inject(s, mode, seqmode, base):
-    """Fire the actuation. mode 'single' = one cmd4E frame (old behavior, for A/B);
-    'cluster' = the full observed ACT_CLUSTER with per-frame SEQ per seqmode."""
+def _inject(s, mode, seqmode, base, roles="as-captured"):
+    """Fire the actuation.
+      mode 'single' = one cmd4E frame (the trigger, for A/B).
+      mode 'cluster' = the full observed ACT_CLUSTER, per-frame SEQ per seqmode.
+      roles 'as-captured' = the cluster's original role bytes; 'e7' = force every
+        frame to role=E7 (the direction WE send) -- the direction A/B for the
+        open actuation question."""
     if mode == "single":
         q = _next_seq(seqmode, base, 0, 0x0C)
-        tx(s, build_frame(q, 0x55, 0x4E, [0x04]), "INJECT cmd4E data04 seq=%02X" % q)
+        r = ROLE_MOD if roles == "e7" else 0x55
+        tx(s, build_frame(q, r, 0x4E, [0x04]),
+           "INJECT cmd4E data04 seq=%02X role=%02X" % (q, r))
         return
     for i, (role, cmd, data, capseq) in enumerate(ACT_CLUSTER):
+        if roles == "e7":
+            role = ROLE_MOD
         q = _next_seq(seqmode, base, i, capseq)
         d = ' '.join('%02X' % x for x in data) or "-"
-        tx(s, build_frame(q, role, cmd, data), "INJECT %02X %s seq=%02X" % (cmd, d, q))
+        tx(s, build_frame(q, role, cmd, data),
+           "INJECT %02X %s seq=%02X role=%02X" % (cmd, d, q, role))
+
+def _print_act_summary(baseline, post):
+    """End-of-run report: which (role,cmd) the MCU sent before vs after the
+    injection, and whether anything NEW appeared after it."""
+    new = sorted(set(post) - set(baseline))
+    print("\n=== ACT SUMMARY ===")
+    print("  pre-injection baseline (role,cmd):count")
+    for rc, n in sorted(baseline.items()):
+        print("    role=%02X cmd=%02X  x%-3d" % (rc[0], rc[1], n))
+    print("  post-injection (role,cmd):count")
+    for rc, n in sorted(post.items()):
+        tag = "   *** NEW" if rc not in baseline else ""
+        print("    role=%02X cmd=%02X  x%-3d%s" % (rc[0], rc[1], n, tag))
+    if new:
+        print("  -> NEW frame(s) after injection: %s"
+              % ", ".join("role=%02X/cmd=%02X" % rc for rc in new))
+        print("     The MCU reacted to the injection (it never sent these before).")
+    else:
+        print("  -> no NEW frame after injection; only repeats of baseline frames.")
+        print("     Still check: did it BEEP? A beep with no new frame = an internal")
+        print("     reaction (the MCU acted but sent no distinct frame).")
+        print("     If no beep either, the as-captured roles are likely the wrong")
+        print("     direction -- next A/B: re-run with --roles e7 (we send E7).")
 
 def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
-        hello_timeout=15.0, after="cmd09"):
-    print("Act (corrected direction): handshake, then inject %s after %ds settle "
-          "(seq=%s). Ctrl-C to stop." % (mode, settle, seqmode))
-    print("  NOTE: actuation direction is an OPEN PROBLEM — the ACT_CLUSTER role")
-    print("  bytes are as-captured and unvalidated under the corrected model;")
-    print("  watch for a beep / 0x25 status flip to learn who actually triggers it.")
+        hello_timeout=15.0, after="cmd09", poll=2.0, roles="as-captured"):
+    print("Act (corrected direction): handshake, then inject %s (roles=%s) after "
+          "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
+          % (mode, roles, settle, seqmode, poll))
+    print("  Watch for: a BEEP + any *** NEW *** post-injection frame + any role=55")
+    print("  async event. The harness prints a baseline->inject->watch summary.")
+    print("  OPEN PROBLEM: actuation direction is unvalidated. On the bench the lock")
+    print("  can't physically actuate, so a beep / new MCU frame is the observable")
+    print("  signal. (A 0x25 status flip needs the assembled lock.)")
     seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
     if seq is None:
         return
     end = time.time() + seconds
     settle_at = time.time() + settle
+    last_poll = 0.0
     injected = False
     max_seq = 0x00
-    while time.time() < end:
-        b = recv_frame(s, timeout=1.5)
-        if b:
-            f = log_frame("<-", b)
-            if f:
-                max_seq = max(max_seq, f["fields"][1])     # fields[1] = SEQ
-                _check_expected(f)
-        if not injected and time.time() >= settle_at:
-            _inject(s, mode, seqmode, max_seq)
-            injected = True
+    baseline = {}      # (role,cmd) -> count, seen BEFORE the injection
+    post = {}          # (role,cmd) -> count, seen AFTER the injection
+    try:
+        while time.time() < end:
+            b = recv_frame(s, timeout=1.0)
+            if b:
+                f = log_frame("<-", b)
+                if f:
+                    rc = (f["fields"][2], f["fields"][3])
+                    bucket = post if injected else baseline
+                    bucket[rc] = bucket.get(rc, 0) + 1
+                    max_seq = max(max_seq, f["fields"][1])     # fields[1] = SEQ
+                    _check_expected(f)
+                    if injected and rc not in baseline:
+                        print("    *** NEW post-injection frame: role=%02X cmd=%02X" % rc)
+                    elif injected and rc[0] == ROLE_MCU_CMD:
+                        print("    (55 async frame, post-injection)")
+            # keep steady state calm: periodic module status report (E7 cmd25)
+            if poll and time.time() - last_poll >= poll:
+                rcmd, rd = STEADY_REQ
+                tx(s, build_frame(seq, ROLE_MOD, rcmd, rd),
+                   "status cmd25 %s seq=%02X" % (_d(rd), seq))
+                seq = (seq + 1) & 0xFF
+                last_poll = time.time()
+            if not injected and time.time() >= settle_at:
+                print("\n>>> === INJECTING %s roles=%s (seq=%s, base=%02X) ==="
+                      % (mode, roles, seqmode, max_seq))
+                _inject(s, mode, seqmode, max_seq, roles)
+                print(">>> === POST-INJECTION WATCH: listen for a BEEP ===\n")
+                injected = True
+    except KeyboardInterrupt:
+        pass
+    _print_act_summary(baseline, post)
 
 def sniff(s, seconds=30):
     print("Passive sniff for %ds (shows which pin carries which direction). Ctrl-C to stop." % seconds)
@@ -500,6 +559,11 @@ def main():
                       help="cluster = full observed actuation sequence; single = one cmd4E frame (A/B test)")
     pact.add_argument("--seq",choices=["track","capture","zero"],default="track",
                       help="track = next-available SEQ (fixes stale-seq); capture = capture-3 SEQs; zero = 0x00")
+    pact.add_argument("--roles",choices=["as-captured","e7"],default="as-captured",
+                      help="as-captured = the cluster's original role bytes; e7 = force every "
+                           "frame to role=E7 (the direction we send) -- the direction A/B")
+    pact.add_argument("--poll",type=float,default=2.0,
+                      help="seconds between periodic cmd25 status reports during the test (0 = quiet baseline)")
     a = ap.parse_args()
 
     if a.cmd == "calibrate":
@@ -521,7 +585,7 @@ def main():
         try:
             if a.cmd=="sniff": sniff(s, a.seconds)
             elif a.cmd=="emulate": emulate(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll_every=a.poll)
-            elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after)
+            elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles=a.roles)
         except KeyboardInterrupt:
             print("\nstopped")
         s.close()
