@@ -341,24 +341,28 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
     print("Waiting for the 913's boot prefix (%s)..." % want)
     if not _wait_prefix(s, timeout=hello_timeout, after=after):
         print("No prefix in %.0fs. Is the enable pin tied High and the 913 power-cycled?" % hello_timeout)
+        print("  (the boot prefix is sent ONLY at power-on: power-cycle AFTER this script started)")
         return None
     print("Prefix seen -> transmitting our E7 request sequence.")
     return send_reqs(s, 0x01)     # 913 echoes our SEQ in replies (match probe_e7.py)
 
 # =====================================================================
-# ACTUATION CLUSTER  (OPEN PROBLEM — live test pending)
+# ACTUATION CLUSTER
 # =====================================================================
-# These are the actuation frames from the CSV capture. DIRECTION UNDER THE
-# CORRECTED ROLE MODEL IS AMBIGUOUS and NOT yet validated:
-#   * The old model read them as "module (us) TX". But the CSV actually places
-#     the actuation frames on the MCU->module wire, so with corrected roles the
-#     MCU likely INITIATES the actuation (pushes it to the module) — the module
-#     may not command lock/unlock directly.
-#   * The role bytes below (E7/55/AA mix) are as-captured; under the corrected
-#     model the MCU only ever transmits AA/55, so a mixed-role "module TX"
-#     cluster is internally inconsistent with the confirmed direction.
-# Treat this as ONE testable variant for the live actuation test (next step):
-# fire it after the corrected handshake and watch for a beep / 0x25 status flip.
+# Actuation frames from the CSV capture (different board revision).
+#
+# LIVE-VALIDATED 2026-11-16 (bench 913, lock was UNLOCKED before the run):
+#   * Injecting the cluster with --roles e7 PHYSICALLY ACTUATED the lock
+#     (unlocked -> LOCKED). With --roles as-captured the MCU ignored every
+#     55/AA frame (negative result) — it only acts on the E7 (module->MCU)
+#     direction.
+#   * Trigger frame: E7 cmd4E data04. The MCU confirms ~30ms later with
+#     55 cmd4E data03 (its MCU->module report).
+#   * Open questions: is cmd4E ALONE sufficient (the run fired all 7 as a
+#     burst; isolation pending) and what does the data byte encode
+#     (request data04 = LOCK; the reply's data03 is probably a post-lock
+#     status — the UNLOCK byte is untested).
+#
 # CHECK bytes are computed by build_frame(); SEQ is assigned at run time.
 #
 # Each entry: (role, cmd, data, capture_seq).
@@ -464,21 +468,20 @@ def _print_act_summary(baseline, post):
         print("     The MCU reacted to the injection (it never sent these before).")
     else:
         print("  -> no NEW frame after injection; only repeats of baseline frames.")
-        print("     Still check: did it BEEP? A beep with no new frame = an internal")
-        print("     reaction (the MCU acted but sent no distinct frame).")
-        print("     If no beep either, the as-captured roles are likely the wrong")
-        print("     direction -- next A/B: re-run with --roles e7 (we send E7).")
+        print("     Still check: did it BEEP or did the lock move? A motor action")
+        print("     with no new frame = an internal reaction (the MCU acted but")
+        print("     sent no distinct frame). Note: the validated trigger direction")
+        print("     is --roles e7 (module->MCU); as-captured 55/AA are ignored.")
 
 def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
         hello_timeout=15.0, after="cmd09", poll=2.0, roles="as-captured"):
     print("Act (corrected direction): handshake, then inject %s (roles=%s) after "
           "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
           % (mode, roles, settle, seqmode, poll))
-    print("  Watch for: a BEEP + any *** NEW *** post-injection frame + any role=55")
-    print("  async event. The harness prints a baseline->inject->watch summary.")
-    print("  OPEN PROBLEM: actuation direction is unvalidated. On the bench the lock")
-    print("  can't physically actuate, so a beep / new MCU frame is the observable")
-    print("  signal. (A 0x25 status flip needs the assembled lock.)")
+    print("  Watch for: a BEEP + any *** NEW *** post-injection frame + the lock itself.")
+    print("  Direction VALIDATED 2026-11-16: --roles e7 (module->MCU) actuated the")
+    print("  real lock (E7 cmd4E data04 = LOCK; MCU confirms with 55 cmd4E).")
+    print("  The as-captured 55/AA roles are ignored by the MCU.")
     seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
     if seq is None:
         return
