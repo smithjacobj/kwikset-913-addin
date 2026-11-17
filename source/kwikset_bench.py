@@ -271,7 +271,8 @@ STEADY_REQ = (0x25, [0x27, 0x00])
 # board does not reply to the config request.)
 EXPECTED = {
     0x02: (0xAA, [0x08, 0x00, 0x45, 0x01]),  # ID/cap blob (board-specific)
-    0x07: (0xAA, [0x02]),
+    # 0x07: state-dependent -- handled in _check_expected (01 locked /
+    # 02 unlocked on this bench board; the capture board replies 00).
     0x08: (0xAA, [0x00]),
     0x09: (0xAA, [0x46]),
     0x30: (0x55, [0x03]),
@@ -298,15 +299,23 @@ def send_reqs(s, seq):
 
 def _check_expected(f):
     """Validate an incoming 913 frame against this board's expected reply.
-    Silent on a match; one warning line if role or data differ from EXPECTED."""
-    exp = EXPECTED.get(f["fields"][3])
+    Silent on a match; one warning line if role or data differ from EXPECTED.
+    cmd07 is special: its reply data byte is the lock-state readout (01 locked
+    / 02 unlocked on this bench board; 00 on the capture board) -- logged as
+    info, never as a mismatch."""
+    cmd, role, data = f["fields"][3], f["fields"][2], f["fields"][4:]
+    if cmd == 0x07:
+        state = {0x01: "LOCKED", 0x02: "unlocked"}.get(
+            data[0] if data else None, "unknown")
+        print("      ^ cmd07 reply data=%s -> lock state: %s" % (_d(data), state))
+        return
+    exp = EXPECTED.get(cmd)
     if exp is None:
         return
     e_role, e_data = exp
-    role, data = f["fields"][2], f["fields"][4:]
     if role != e_role or data != e_data:
         print("      ^^ MISMATCH cmd%02X: want role=%02X data=%s, got role=%02X data=%s"
-              % (f["fields"][3], e_role, _d(e_data), role, _d(data)))
+              % (cmd, e_role, _d(e_data), role, _d(data)))
 
 def _wait_prefix(s, timeout=15.0, after="cmd09"):
     """Wait for the 913's boot prefix. The MCU INITIATES: it transmits the hello
@@ -392,17 +401,37 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
 #     cmd09 data5A encode; reply data03 appears on BOTH the cmd4E and cmd2A
 #     acks -> a generic ack/status code, not a state value.
 #
+# CAPTURE-DERIVED MODEL (captures/start-*.csv: real Z-Wave module + this MCU,
+# board ID 04 00 36 0D; same sniffer session as start-unlock-lock.csv):
+#   * 12.06 s after the handshake the MCU spontaneously sends E7 cmd09 data5A
+#     (a prompt); the module replies cmd4E; the MCU acks 55 cmd4E data04.
+#   * Per actuation event the module sends BOTH state commands, target LAST:
+#     from locked: cmd03 (no-op reseat), cmd05 (unlock); from unlocked:
+#     cmd05 (no-op), cmd03 (lock) -- interleaved with cmd07 status polls
+#     (~6.3 s apart). The MCU's async 55 cmd2A data14 = "motor complete,"
+#     arriving a fixed ~10.5 s after EVERY state command (no-op included),
+#     followed ~60 ms later by an AA echo-ack of the LAST state command.
+#     The module waits for the complete event before issuing the next command.
+#   => cmd03 = absolute LOCK (extend bolt), cmd05 = absolute UNLOCK (retract);
+#      each motor-runs to the commanded end state even when already there.
+#      Matches all 7 bench tests (unlocked start + cmd03 -> locked).
+#      PENDING bench confirmation: cmd05 from locked -> unlock; cmd03 from
+#      locked -> no-op reseat (17th 11:47 run, observation pending).
+#   => cmd07 = status poll; its reply data byte is the state readout on the
+#      bench board (01 locked / 02 unlocked; the capture board replies 00).
+#
 # CHECK bytes are computed by build_frame(); SEQ is assigned at run time.
 #
 # Each entry: (role, cmd, data, capture_seq).
 ACT_CLUSTER = [
     (0xE7, 0x09, [0x5A], 0x02),  # req  cmd09 data5A   (dialogue only; no actuation)
-    (0x55, 0x4E, [0x04], 0x0C),  # cmd  cmd4E data04   (ack-only; NOT the trigger)
-    (0xAA, 0x07, [0x00], 0x0E),  # resp cmd07 data00   (dialogue only; no actuation)
-    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14   (ack-only; NOT the trigger, like cmd4E)
+    (0x55, 0x4E, [0x04], 0x0C),  # cmd  cmd4E data04   (module reply to the MCU's cmd09 5A prompt; ack-only)
+    (0xAA, 0x07, [0x00], 0x0E),  # resp cmd07 data00   (status poll; reply byte = state readout)
+    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14   (MCU "motor complete" async event, ~10.5s after a state cmd)
     (0xAA, 0x03, [],     0x0F),  # resp cmd03          (THE trigger: confirmed alone, x2, un-acked)
     (0x55, 0x2A, [0x14], 0x04),  # cmd  cmd2A data14 (repeat; not required)
     (0xAA, 0x03, [],     0x0F),  # resp cmd03 (repeat; not required)
+    (0xE7, 0x05, [],     0x0F),  # req  cmd05 no data  (capture model: the UNLOCK command; bench-confirm pending)
 ]
 
 def recv_frame(s, timeout=2.0):
@@ -526,9 +555,10 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
           "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
           % (what, roles, settle, seqmode, poll))
     print("  Watch for: a BEEP + any *** NEW *** post-injection frame + the lock itself.")
-    print("  VALIDATED 11-16/17: only the E7 (module->MCU) direction actuates; cmd4E,")
-    print("  cmd09, cmd07, and cmd2A are ack/dialogue-only. cmd03 (zero data) is the")
-    print("  CONFIRMED motor trigger (actuated alone, 2 samples, often un-acked).")
+    print("  MODEL (bench 11-16/17 + Z-Wave captures): cmd03 = LOCK (confirmed")
+    print("  from unlocked, x3); cmd05 = UNLOCK (from captures; bench confirm")
+    print("  pending). cmd09/cmd07/cmd2A/cmd4E are dialogue/ack-only. The cmd07")
+    print("  reply data byte is the state readout (01 locked / 02 unlocked).")
     seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
     if seq is None:
         return
@@ -644,7 +674,7 @@ def main():
                       help="seconds between periodic cmd25 status reports during the test (0 = quiet baseline)")
     pact.add_argument("--frames",default=None,metavar="LIST",
                       help="cluster mode only: comma-separated ACT_CLUSTER indices to inject, "
-                           "e.g. --frames 0,2,3,4,5,6 = everything except the cmd4E trigger")
+                           "e.g. --frames 4 = cmd03 (LOCK) alone; --frames 7 = cmd05 (UNLOCK) alone")
     a = ap.parse_args()
     if getattr(a, "log", None):
         logpath = a.log
