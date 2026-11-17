@@ -351,17 +351,17 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
 # =====================================================================
 # Actuation frames from the CSV capture (different board revision).
 #
-# LIVE-VALIDATED 2026-11-16 (bench 913, lock was UNLOCKED before the run):
-#   * Injecting the cluster with --roles e7 PHYSICALLY ACTUATED the lock
-#     (unlocked -> LOCKED). With --roles as-captured the MCU ignored every
-#     55/AA frame (negative result) — it only acts on the E7 (module->MCU)
-#     direction.
-#   * Trigger frame: E7 cmd4E data04. The MCU confirms ~30ms later with
-#     55 cmd4E data03 (its MCU->module report).
-#   * Single-frame isolation (2026-11-16, 15:48 run): sending ONLY E7 cmd4E
-#     data04 -> the MCU confirmed (55 cmd4E data03) but the motor did NOT
-#     move. So cmd4E alone is NOT sufficient: some other cluster frame (or
-#     precondition) is required. Bisecting with --frames now.
+# LIVE-VALIDATED 2026-11-16 (bench 913, each test starting UNLOCKED):
+#   * --roles as-captured (original 55/AA bytes): the MCU ignored everything
+#     (negative). It only acts on the E7 (module->MCU) direction.
+#   * Full cluster as E7 (15:34): lock ACTUATED (unlocked -> LOCKED); MCU
+#     sent 55 cmd4E data03 (the cmd4E ack, not the motor event).
+#   * cmd4E ALONE as E7 (15:48): MCU acked (55 cmd4E data03) but the motor
+#     did NOT move -> cmd4E is ack-only, NOT the motor trigger.
+#   * Cluster MINUS cmd4E as E7 (16:03, frames 0,2,3,4,5,6): lock ACTUATED,
+#     but the MCU sent no 55 frame at all (silent motor action). -> the real
+#     motor trigger is among {cmd09 5A, cmd07 00, cmd2A 14, cmd03}; bisecting
+#     with --frames (the MCU only replies to cmd09/cmd07, so those two lead).
 #   * Open: what does the data byte encode (request data04 = LOCK; the
 #     reply's data03 is probably a post-lock status — the UNLOCK byte is
 #     untested).
@@ -500,9 +500,9 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
           "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
           % (what, roles, settle, seqmode, poll))
     print("  Watch for: a BEEP + any *** NEW *** post-injection frame + the lock itself.")
-    print("  Direction VALIDATED 2026-11-16: --roles e7 (module->MCU) actuated the")
-    print("  real lock (E7 cmd4E data04 = LOCK; MCU confirms with 55 cmd4E).")
-    print("  The as-captured 55/AA roles are ignored by the MCU.")
+    print("  VALIDATED 2026-11-16: only the E7 (module->MCU) direction actuates; the")
+    print("  as-captured 55/AA roles are ignored. cmd4E is ack-only (55 cmd4E data03);")
+    print("  the motor trigger is among cmd09/cmd07/cmd2A/cmd03 -- bisecting with --frames.")
     seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
     if seq is None:
         return
