@@ -351,32 +351,44 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
 # =====================================================================
 # Actuation frames from the CSV capture (different board revision).
 #
-# LIVE-VALIDATED 2026-11-16 (bench 913, each test starting UNLOCKED):
+# LIVE-VALIDATED 2026-11-16/17 (bench 913, each test starting UNLOCKED):
 #   * --roles as-captured (original 55/AA bytes): the MCU ignored everything
 #     (negative). It only acts on the E7 (module->MCU) direction.
-#   * Full cluster as E7 (15:34): lock ACTUATED (unlocked -> LOCKED); MCU
-#     sent 55 cmd4E data03 (the cmd4E ack, not the motor event).
-#   * cmd4E ALONE as E7 (15:48): MCU acked (55 cmd4E data03) but the motor
-#     did NOT move -> cmd4E is ack-only, NOT the motor trigger.
-#   * Cluster MINUS cmd4E as E7 (16:03, frames 0,2,3,4,5,6): lock ACTUATED,
-#     but the MCU sent no 55 frame at all (silent motor action). -> the real
-#     motor trigger is among {cmd09 5A, cmd07 00, cmd2A 14, cmd03}; bisecting
-#     with --frames (the MCU only replies to cmd09/cmd07, so those two lead).
-#   * Open: what does the data byte encode (request data04 = LOCK; the
-#     reply's data03 is probably a post-lock status — the UNLOCK byte is
-#     untested).
+#   * Full cluster as E7 (16th 15:34): lock ACTUATED; MCU sent 55 cmd4E
+#     data03 (the cmd4E ack, not the motor event).
+#   * cmd4E ALONE (16th 15:48): MCU acked but the motor did NOT move
+#     -> cmd4E is ack-only, NOT the motor trigger.
+#   * Cluster MINUS cmd4E (16th 16:03, frames 0,2,3,4,5,6): ACTUATED, no 55
+#     frames (silent execution — the dialogue frames led the burst).
+#   * cmd09 5A + cmd07 00 alone (16th 16:10, frames 0,2): the MCU replied
+#     AA to both but the lock did NOT move -> dialogue pair ruled out; it
+#     only converses, never executes.
+#   * cmd2A 14 + cmd03, DUPLICATED (16th 16:39, frames 3,4,5,6): ACTUATED;
+#     MCU replied 55 cmd2A data03 + 55 cmd03 (motor frames led the burst).
+#   * cmd2A 14 + cmd03, SINGLE COPY (17th 10:43, frames 3,4): ACTUATED
+#     -> duplicates are NOT required; the single ordered pair is the minimal
+#     known trigger. Wire: 55 cmd2A data03 (+32 ms), then a delayed 55 cmd2A
+#     data=15 FF (~2.9 s later, seq=03) — likely motor-complete; 1 sample,
+#     undecoded. The 55 cmd03 reply appeared only with the duplicated pair.
+#   * Bisecting the pair now: cmd2A 14 alone (--frames 3), then cmd03 alone
+#     (--frames 4). If neither acts alone, the ordered pair is the minimal
+#     trigger (an ordering/combination finding).
+#   * Open: what the data bytes encode (cmd2A data14, cmd4E data04, cmd09
+#     data5A); reply data03 appears on BOTH the cmd4E and cmd2A acks -> a
+#     generic ack/status code, not a state value. UNLOCK-direction bytes are
+#     untested.
 #
 # CHECK bytes are computed by build_frame(); SEQ is assigned at run time.
 #
 # Each entry: (role, cmd, data, capture_seq).
 ACT_CLUSTER = [
-    (0xE7, 0x09, [0x5A], 0x02),  # req  cmd09 data5A
-    (0x55, 0x4E, [0x04], 0x0C),  # cmd  cmd4E data04  <- the trigger
-    (0xAA, 0x07, [0x00], 0x0E),  # resp cmd07 data00
-    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14
-    (0xAA, 0x03, [],     0x0F),  # resp cmd03
-    (0x55, 0x2A, [0x14], 0x04),  # cmd  cmd2A data14 (repeat)
-    (0xAA, 0x03, [],     0x0F),  # resp cmd03 (repeat)
+    (0xE7, 0x09, [0x5A], 0x02),  # req  cmd09 data5A   (dialogue only; no actuation)
+    (0x55, 0x4E, [0x04], 0x0C),  # cmd  cmd4E data04   (ack-only; NOT the trigger)
+    (0xAA, 0x07, [0x00], 0x0E),  # resp cmd07 data00   (dialogue only; no actuation)
+    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14   <- MOTOR TRIGGER (with cmd03)
+    (0xAA, 0x03, [],     0x0F),  # resp cmd03          <- MOTOR TRIGGER (with cmd2A)
+    (0x55, 0x2A, [0x14], 0x04),  # cmd  cmd2A data14 (repeat; not required)
+    (0xAA, 0x03, [],     0x0F),  # resp cmd03 (repeat; not required)
 ]
 
 def recv_frame(s, timeout=2.0):
@@ -500,9 +512,9 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
           "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
           % (what, roles, settle, seqmode, poll))
     print("  Watch for: a BEEP + any *** NEW *** post-injection frame + the lock itself.")
-    print("  VALIDATED 2026-11-16: only the E7 (module->MCU) direction actuates; the")
-    print("  as-captured 55/AA roles are ignored. cmd4E is ack-only (55 cmd4E data03);")
-    print("  the motor trigger is among cmd09/cmd07/cmd2A/cmd03 -- bisecting with --frames.")
+    print("  VALIDATED 11-16/17: only the E7 (module->MCU) direction actuates; cmd4E")
+    print("  and cmd09/cmd07 are ack/dialogue-only. The single-copy pair cmd2A 14 +")
+    print("  cmd03 IS the motor trigger (duplicates not needed) -- bisecting the pair.")
     seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
     if seq is None:
         return
