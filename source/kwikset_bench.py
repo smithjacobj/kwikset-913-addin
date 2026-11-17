@@ -370,9 +370,13 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
 #     known trigger. Wire: 55 cmd2A data03 (+32 ms), then a delayed 55 cmd2A
 #     data=15 FF (~2.9 s later, seq=03) — likely motor-complete; 1 sample,
 #     undecoded. The 55 cmd03 reply appeared only with the duplicated pair.
-#   * Bisecting the pair now: cmd2A 14 alone (--frames 3), then cmd03 alone
-#     (--frames 4). If neither acts alone, the ordered pair is the minimal
-#     trigger (an ordering/combination finding).
+#   * cmd2A 14 ALONE (17th 11:02, frame 3): MCU acked 55 cmd2A data03 but the
+#     lock did NOT move -> cmd2A is ack-only (like cmd4E), NOT the trigger.
+#   * cmd03 ALONE (17th 11:08, frame 4): user reported the lock moved, but the
+#     MCU did NOT ack it (total silence — no 55, not even an AA reply). This
+#     INVERTS the expected pattern (acked cmd2A didn't move; un-acked cmd03
+#     did). SINGLE SAMPLE, model-inverting -> re-running to confirm before
+#     rewriting the model (rule out a nudge during the power-cycle).
 #   * Open: what the data bytes encode (cmd2A data14, cmd4E data04, cmd09
 #     data5A); reply data03 appears on BOTH the cmd4E and cmd2A acks -> a
 #     generic ack/status code, not a state value. UNLOCK-direction bytes are
@@ -385,8 +389,8 @@ ACT_CLUSTER = [
     (0xE7, 0x09, [0x5A], 0x02),  # req  cmd09 data5A   (dialogue only; no actuation)
     (0x55, 0x4E, [0x04], 0x0C),  # cmd  cmd4E data04   (ack-only; NOT the trigger)
     (0xAA, 0x07, [0x00], 0x0E),  # resp cmd07 data00   (dialogue only; no actuation)
-    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14   <- MOTOR TRIGGER (with cmd03)
-    (0xAA, 0x03, [],     0x0F),  # resp cmd03          <- MOTOR TRIGGER (with cmd2A)
+    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14   (ack-only alone; TRIGGER with cmd03)
+    (0xAA, 0x03, [],     0x0F),  # resp cmd03          (TRIGGER with cmd2A; alone=unconfirmed)
     (0x55, 0x2A, [0x14], 0x04),  # cmd  cmd2A data14 (repeat; not required)
     (0xAA, 0x03, [],     0x0F),  # resp cmd03 (repeat; not required)
 ]
@@ -512,9 +516,9 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
           "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
           % (what, roles, settle, seqmode, poll))
     print("  Watch for: a BEEP + any *** NEW *** post-injection frame + the lock itself.")
-    print("  VALIDATED 11-16/17: only the E7 (module->MCU) direction actuates; cmd4E")
-    print("  and cmd09/cmd07 are ack/dialogue-only. The single-copy pair cmd2A 14 +")
-    print("  cmd03 IS the motor trigger (duplicates not needed) -- bisecting the pair.")
+    print("  VALIDATED 11-16/17: only the E7 (module->MCU) direction actuates; cmd4E,")
+    print("  cmd09, cmd07, and cmd2A (alone) are ack/dialogue-only. The confirmed")
+    print("  minimal trigger is the pair cmd2A 14 + cmd03 -- confirming cmd03-alone.")
     seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
     if seq is None:
         return
