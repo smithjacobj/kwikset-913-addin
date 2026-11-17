@@ -415,8 +415,17 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
 #   => cmd03 = absolute LOCK (extend bolt), cmd05 = absolute UNLOCK (retract);
 #      each motor-runs to the commanded end state even when already there.
 #      Matches all 7 bench tests (unlocked start + cmd03 -> locked).
-#      PENDING bench confirmation: cmd05 from locked -> unlock; cmd03 from
-#      locked -> no-op reseat (17th 11:47 run, observation pending).
+# BENCH-CONFIRMED BOTH DIRECTIONS (17th):
+#   * cmd05 alone from LOCKED (13:37): bolt RETRACTED (unlocked). MCU sent
+#     55 cmd2A data=15 FF ~3.9 s after injection (bench motor-complete);
+#     no AA echo-ack this time (bench acks stay flaky).
+#   * cmd03 alone from LOCKED (11:47): NO-MOVE no-op reseat -- confirmed by
+#     the 13:37 handshake state readout (cmd07 reply 01 = still LOCKED at
+#     the next boot).
+#   * BENCH motor-complete = 55 cmd2A data 15 FF (~3-4 s after actuation;
+#     2 samples: 10:43 pair run, 13:37 cmd05) vs the capture board's
+#     55 cmd2A data 14 at ~10.5 s. Status LED stays OFF after our bench
+#     commands (real module keeps it blinking) -- noted, not chased.
 #   => cmd07 = status poll; its reply data byte is the state readout on the
 #      bench board (01 locked / 02 unlocked; the capture board replies 00).
 #
@@ -431,7 +440,7 @@ ACT_CLUSTER = [
     (0xAA, 0x03, [],     0x0F),  # resp cmd03          (THE trigger: confirmed alone, x2, un-acked)
     (0x55, 0x2A, [0x14], 0x04),  # cmd  cmd2A data14 (repeat; not required)
     (0xAA, 0x03, [],     0x0F),  # resp cmd03 (repeat; not required)
-    (0xE7, 0x05, [],     0x0F),  # req  cmd05 no data  (capture model: the UNLOCK command; bench-confirm pending)
+    (0xE7, 0x05, [],     0x0F),  # req  cmd05 no data  (UNLOCK: bench-confirmed 17th 13:37 from locked)
 ]
 
 def recv_frame(s, timeout=2.0):
@@ -486,6 +495,13 @@ def _next_seq(seqmode, base, i, capseq):
     if seqmode == "zero":
         return 0x00
     return (base + 1 + i) & 0xFF
+
+def _cluster_idx(cmd, data=b""):
+    """First ACT_CLUSTER index whose (cmd, data) match (for lock/unlock)."""
+    for i, (role, c, d, capseq) in enumerate(ACT_CLUSTER):
+        if c == cmd and d == list(data):
+            return i
+    raise SystemExit("no ACT_CLUSTER entry for cmd%02X data=%s" % (cmd, _d(data)))
 
 def _parse_frames(spec):
     """Parse a --frames spec like '0,2,3,4,5,6' into cluster indices."""
@@ -549,16 +565,16 @@ def _print_act_summary(baseline, post):
 
 def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
         hello_timeout=15.0, after="cmd09", poll=2.0, roles="as-captured",
-        frames=None):
-    what = mode if frames is None else "subset %s" % frames
+        frames=None, label=None):
+    what = label if label is not None else (mode if frames is None else "subset %s" % frames)
     print("Act (corrected direction): handshake, then inject %s (roles=%s) after "
           "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
           % (what, roles, settle, seqmode, poll))
     print("  Watch for: a BEEP + any *** NEW *** post-injection frame + the lock itself.")
-    print("  MODEL (bench 11-16/17 + Z-Wave captures): cmd03 = LOCK (confirmed")
-    print("  from unlocked, x3); cmd05 = UNLOCK (from captures; bench confirm")
-    print("  pending). cmd09/cmd07/cmd2A/cmd4E are dialogue/ack-only. The cmd07")
-    print("  reply data byte is the state readout (01 locked / 02 unlocked).")
+    print("  MODEL (bench 11-16/17 + captures, both directions confirmed):")
+    print("  cmd03 = LOCK, cmd05 = UNLOCK (absolute; each motor-runs even when")
+    print("  already in state). cmd09/cmd07/cmd2A/cmd4E are dialogue/ack-only.")
+    print("  cmd07 reply data byte = state readout (01 locked / 02 unlocked).")
     seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
     if seq is None:
         return
@@ -642,7 +658,7 @@ def main():
     sub.add_parser("calibrate").add_argument("files", nargs="+")
     sub.add_parser("verify").add_argument("files", nargs="+")
     parsers = {}
-    for m in ("sniff","emulate","act"):
+    for m in ("sniff","emulate","act","lock","unlock"):
         p = sub.add_parser(m)
         p.add_argument("-p","--port",required=True)
         p.add_argument("--swap",action="store_true")
@@ -675,6 +691,15 @@ def main():
     pact.add_argument("--frames",default=None,metavar="LIST",
                       help="cluster mode only: comma-separated ACT_CLUSTER indices to inject, "
                            "e.g. --frames 4 = cmd03 (LOCK) alone; --frames 7 = cmd05 (UNLOCK) alone")
+    # Convenience: drive one absolute state command (bench-confirmed both
+    # directions: cmd03 = LOCK, cmd05 = UNLOCK).
+    for m in ("lock","unlock"):
+        pm = parsers[m]
+        pm.add_argument("--settle",type=int,default=8,help="seconds of handshake before injecting")
+        pm.add_argument("--seq",choices=["track","capture","zero"],default="track",
+                        help="track = next-available SEQ (fixes stale-seq); capture = capture-3 SEQs; zero = 0x00")
+        pm.add_argument("--poll",type=float,default=2.0,
+                        help="seconds between periodic cmd25 status reports during the test (0 = quiet baseline)")
     a = ap.parse_args()
     if getattr(a, "log", None):
         logpath = a.log
@@ -704,6 +729,11 @@ def main():
             if a.cmd=="sniff": sniff(s, a.seconds)
             elif a.cmd=="emulate": emulate(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll_every=a.poll)
             elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles=a.roles, frames=_parse_frames(a.frames))
+            elif a.cmd in ("lock","unlock"):
+                c = 0x03 if a.cmd == "lock" else 0x05
+                act(s, seconds=a.seconds, settle=a.settle, mode="cluster", seqmode=a.seq,
+                    hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles="e7",
+                    frames=[_cluster_idx(c)], label="%s (cmd%02X)" % (a.cmd.upper(), c))
         except KeyboardInterrupt:
             print("\nstopped")
         s.close()
