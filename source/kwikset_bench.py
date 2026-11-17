@@ -372,15 +372,25 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
 #     undecoded. The 55 cmd03 reply appeared only with the duplicated pair.
 #   * cmd2A 14 ALONE (17th 11:02, frame 3): MCU acked 55 cmd2A data03 but the
 #     lock did NOT move -> cmd2A is ack-only (like cmd4E), NOT the trigger.
-#   * cmd03 ALONE (17th 11:08, frame 4): user reported the lock moved, but the
-#     MCU did NOT ack it (total silence — no 55, not even an AA reply). This
-#     INVERTS the expected pattern (acked cmd2A didn't move; un-acked cmd03
-#     did). SINGLE SAMPLE, model-inverting -> re-running to confirm before
-#     rewriting the model (rule out a nudge during the power-cycle).
-#   * Open: what the data bytes encode (cmd2A data14, cmd4E data04, cmd09
-#     data5A); reply data03 appears on BOTH the cmd4E and cmd2A acks -> a
-#     generic ack/status code, not a state value. UNLOCK-direction bytes are
-#     untested.
+#   * cmd03 ALONE (17th 11:08 AND 11:21, frame 4, 2 samples): the lock MOVED
+#     both times, yet the MCU did NOT ack it (no 55, no AA cmd03 — only the
+#     periodic cmd25 acks). CONFIRMED reproducible. -> cmd03 is the motor
+#     trigger, NOT cmd2A.
+#   * CORRELATION (all 7 act tests): every run that ACTUATED contained cmd03;
+#     every run that did NOT (cmd09+cmd07, cmd2A alone) lacked it. cmd03
+#     presence is the differentiator — the 55 ack is NOT a reliable actuation
+#     indicator (cmd4E/cmd2A are acked but inert; cmd03 actuates, often
+#     un-acked). Physical observation is the ground truth.
+#   * Open (lock semantics): cmd03 is ZERO-DATA, so the trigger carries no
+#     payload -- does it LOCK, UNLOCK, or TOGGLE? All 7 tests started manually
+#     UNLOCKED and drove to LOCKED. Next experiment: a LOCKED-start run (user
+#     locks, then power-cycles with the script running). ASSUMPTION to verify:
+#     does the MCU's internal bolt state (or a boot position-sense) survive a
+#     power-cycle? If not, the MCU may believe "unlocked" even when the bolt is
+#     in, confounding the toggle-vs-absolute read of the result.
+#   * Open (data bytes, now lower priority): what cmd2A data14 / cmd4E data04 /
+#     cmd09 data5A encode; reply data03 appears on BOTH the cmd4E and cmd2A
+#     acks -> a generic ack/status code, not a state value.
 #
 # CHECK bytes are computed by build_frame(); SEQ is assigned at run time.
 #
@@ -389,8 +399,8 @@ ACT_CLUSTER = [
     (0xE7, 0x09, [0x5A], 0x02),  # req  cmd09 data5A   (dialogue only; no actuation)
     (0x55, 0x4E, [0x04], 0x0C),  # cmd  cmd4E data04   (ack-only; NOT the trigger)
     (0xAA, 0x07, [0x00], 0x0E),  # resp cmd07 data00   (dialogue only; no actuation)
-    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14   (ack-only alone; TRIGGER with cmd03)
-    (0xAA, 0x03, [],     0x0F),  # resp cmd03          (TRIGGER with cmd2A; alone=unconfirmed)
+    (0x55, 0x2A, [0x14], 0x03),  # cmd  cmd2A data14   (ack-only; NOT the trigger, like cmd4E)
+    (0xAA, 0x03, [],     0x0F),  # resp cmd03          (THE trigger: confirmed alone, x2, un-acked)
     (0x55, 0x2A, [0x14], 0x04),  # cmd  cmd2A data14 (repeat; not required)
     (0xAA, 0x03, [],     0x0F),  # resp cmd03 (repeat; not required)
 ]
@@ -517,8 +527,8 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
           % (what, roles, settle, seqmode, poll))
     print("  Watch for: a BEEP + any *** NEW *** post-injection frame + the lock itself.")
     print("  VALIDATED 11-16/17: only the E7 (module->MCU) direction actuates; cmd4E,")
-    print("  cmd09, cmd07, and cmd2A (alone) are ack/dialogue-only. The confirmed")
-    print("  minimal trigger is the pair cmd2A 14 + cmd03 -- confirming cmd03-alone.")
+    print("  cmd09, cmd07, and cmd2A are ack/dialogue-only. cmd03 (zero data) is the")
+    print("  CONFIRMED motor trigger (actuated alone, 2 samples, often un-acked).")
     seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
     if seq is None:
         return
