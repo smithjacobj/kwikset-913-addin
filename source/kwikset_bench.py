@@ -358,10 +358,13 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
 #     direction.
 #   * Trigger frame: E7 cmd4E data04. The MCU confirms ~30ms later with
 #     55 cmd4E data03 (its MCU->module report).
-#   * Open questions: is cmd4E ALONE sufficient (the run fired all 7 as a
-#     burst; isolation pending) and what does the data byte encode
-#     (request data04 = LOCK; the reply's data03 is probably a post-lock
-#     status — the UNLOCK byte is untested).
+#   * Single-frame isolation (2026-11-16, 15:48 run): sending ONLY E7 cmd4E
+#     data04 -> the MCU confirmed (55 cmd4E data03) but the motor did NOT
+#     move. So cmd4E alone is NOT sufficient: some other cluster frame (or
+#     precondition) is required. Bisecting with --frames now.
+#   * Open: what does the data byte encode (request data04 = LOCK; the
+#     reply's data03 is probably a post-lock status — the UNLOCK byte is
+#     untested).
 #
 # CHECK bytes are computed by build_frame(); SEQ is assigned at run time.
 #
@@ -429,20 +432,36 @@ def _next_seq(seqmode, base, i, capseq):
         return 0x00
     return (base + 1 + i) & 0xFF
 
-def _inject(s, mode, seqmode, base, roles="as-captured"):
+def _parse_frames(spec):
+    """Parse a --frames spec like '0,2,3,4,5,6' into cluster indices."""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        i = int(part)
+        if not 0 <= i < len(ACT_CLUSTER):
+            raise SystemExit("--frames index %d out of range 0..%d"
+                             % (i, len(ACT_CLUSTER) - 1))
+        out.append(i)
+    return out or None
+
+def _inject(s, mode, seqmode, base, roles="as-captured", frames=None):
     """Fire the actuation.
-      mode 'single' = one cmd4E frame (the trigger, for A/B).
-      mode 'cluster' = the full observed ACT_CLUSTER, per-frame SEQ per seqmode.
+      mode 'single' = one cmd4E frame (isolation A/B).
+      mode 'cluster' = the observed ACT_CLUSTER, or the --frames subset of it,
+        per-frame SEQ per seqmode.
       roles 'as-captured' = the cluster's original role bytes; 'e7' = force every
-        frame to role=E7 (the direction WE send) -- the direction A/B for the
-        open actuation question."""
+        frame to role=E7 (the direction WE send)."""
     if mode == "single":
         q = _next_seq(seqmode, base, 0, 0x0C)
         r = ROLE_MOD if roles == "e7" else 0x55
         tx(s, build_frame(q, r, 0x4E, [0x04]),
            "INJECT cmd4E data04 seq=%02X role=%02X" % (q, r))
         return
-    for i, (role, cmd, data, capseq) in enumerate(ACT_CLUSTER):
+    idxs = frames if frames is not None else range(len(ACT_CLUSTER))
+    for i in idxs:
+        role, cmd, data, capseq = ACT_CLUSTER[i]
         if roles == "e7":
             role = ROLE_MOD
         q = _next_seq(seqmode, base, i, capseq)
@@ -474,10 +493,12 @@ def _print_act_summary(baseline, post):
         print("     is --roles e7 (module->MCU); as-captured 55/AA are ignored.")
 
 def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
-        hello_timeout=15.0, after="cmd09", poll=2.0, roles="as-captured"):
+        hello_timeout=15.0, after="cmd09", poll=2.0, roles="as-captured",
+        frames=None):
+    what = mode if frames is None else "subset %s" % frames
     print("Act (corrected direction): handshake, then inject %s (roles=%s) after "
           "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
-          % (mode, roles, settle, seqmode, poll))
+          % (what, roles, settle, seqmode, poll))
     print("  Watch for: a BEEP + any *** NEW *** post-injection frame + the lock itself.")
     print("  Direction VALIDATED 2026-11-16: --roles e7 (module->MCU) actuated the")
     print("  real lock (E7 cmd4E data04 = LOCK; MCU confirms with 55 cmd4E).")
@@ -516,8 +537,8 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
                 last_poll = time.time()
             if not injected and time.time() >= settle_at:
                 print("\n>>> === INJECTING %s roles=%s (seq=%s, base=%02X) ==="
-                      % (mode, roles, seqmode, max_seq))
-                _inject(s, mode, seqmode, max_seq, roles)
+                      % (what, roles, seqmode, max_seq))
+                _inject(s, mode, seqmode, max_seq, roles, frames)
                 print(">>> === POST-INJECTION WATCH: listen for a BEEP ===\n")
                 injected = True
     except KeyboardInterrupt:
@@ -595,6 +616,9 @@ def main():
                            "frame to role=E7 (the direction we send) -- the direction A/B")
     pact.add_argument("--poll",type=float,default=2.0,
                       help="seconds between periodic cmd25 status reports during the test (0 = quiet baseline)")
+    pact.add_argument("--frames",default=None,metavar="LIST",
+                      help="cluster mode only: comma-separated ACT_CLUSTER indices to inject, "
+                           "e.g. --frames 0,2,3,4,5,6 = everything except the cmd4E trigger")
     a = ap.parse_args()
     if getattr(a, "log", None):
         logpath = a.log
@@ -623,7 +647,7 @@ def main():
         try:
             if a.cmd=="sniff": sniff(s, a.seconds)
             elif a.cmd=="emulate": emulate(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll_every=a.poll)
-            elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles=a.roles)
+            elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles=a.roles, frames=_parse_frames(a.frames))
         except KeyboardInterrupt:
             print("\nstopped")
         s.close()
