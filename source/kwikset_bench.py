@@ -5,7 +5,12 @@ CORRECTED DIRECTION (Nov 2026 rebuild): the 913 INITIATES. It transmits the boot
 hello (role AA, cmd18) and, left unanswered, re-sends a hello+cmd09 retry prefix
 every ~2.6 s. We (the module) answer by transmitting role=E7 requests; the 913
 replies to each (role AA/55), echoing our request SEQ. See the PROTOCOL MODEL
-section below for the full corrected role model."""
+section below for the full corrected role model.
+
+Subcommands: sniff (passive listen), emulate (module steady state), act
+(injection test), lock/unlock (drive one absolute state), manual (capture what
+the MCU transmits when the lock is operated BY HAND -- the key path the Z-Wave
+add-in board will also have to react to), calibrate/verify (CRC vs captures)."""
 import argparse, sys, os, struct, time
 
 # ---------- CRC-8 (parametric, reflected/non-reflected) ----------
@@ -702,6 +707,113 @@ def sniff(s, seconds=30):
         if b:
             log_frame("<-", b)
 
+# =====================================================================
+# MANUAL-OP CAPTURE  (lock operated BY HAND -> what does the MCU transmit?)
+# =====================================================================
+# For the Z-Wave add-in board the module must react to manual (key) ops, so
+# capture what the MCU puts on the UART when the bolt moves without a UART
+# command. Flow: handshake (like act), then listen for --seconds:
+#   * Every incoming frame is logged. A frame matching the (seq,cmd) of one of
+#     OUR requests is a reply to us (silent for cmd25 poll acks); anything else
+#     is flagged *** MCU-INITIATED *** -- the manual-event candidates.
+#   * As the user FINISHES a manual op they type a label ('lock'/'unlock') +
+#     Enter in the console: a MARK line is stamped and we send one cmd07 state
+#     readout (the state the MCU believes, logged by _check_expected). This
+#     yields a state signal even if the MCU stays silent on manual ops.
+#   * >10 s between MCU frames prints a quiet marker.
+# Start this script FIRST, then power-cycle the lock (boot prefix is power-on
+# only). --poll 0 = fully quiet listen (the session may idle out -- the hello
+# retry loop would then be visible as MCU-initiated).
+def manual(s, seconds=120, hello_timeout=15.0, after="cmd09", poll=2.0):
+    print("Manual-op capture: handshake, then listen %ds while you operate the lock by hand."
+          % seconds)
+    print("  As you FINISH a manual op, type a label (e.g. 'lock'/'unlock') + Enter:")
+    print("  -> a MARK line is stamped and we poll cmd07 once (the state the MCU believes).")
+    print("  Frames we did not request are flagged *** MCU-INITIATED *** (event candidates).")
+    print("  Note the LED too (ground truth): green blink = unlocked, amber = locked.")
+    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
+    if seq is None:
+        return
+    select = None
+    stdin_tty = False
+    try:
+        import select as _select
+        select = _select
+        stdin_tty = sys.stdin.isatty()
+    except Exception:
+        pass
+    pending = {}          # our SEQ -> (cmd we sent, why); a match = reply, not event
+    for i, (cmd, _data) in enumerate(REQS):
+        pending[(0x01 + i) & 0xFF] = (cmd, "handshake")
+    t0 = time.time()
+    end = t0 + seconds
+    last_poll = t0
+    last_rx = t0
+    marks = []
+    counts = {}
+    initiated = {}
+    def _stamp(label):
+        nonlocal seq
+        now = time.time()
+        marks.append((now, label))
+        print("\n=== MARK: %s  (t=%.1fs) ===" % (label, now - t0))
+        q = seq & 0xFF
+        seq = (q + 1) & 0xFF
+        pending[q] = (0x07, "post-mark cmd07")
+        tx(s, build_frame(q, ROLE_MOD, 0x07, []),
+           "post-mark cmd07 state poll seq=%02X" % q)
+    try:
+        while time.time() < end:
+            if stdin_tty:
+                r, _, _ = select.select([sys.stdin], [], [], 0)
+                if r:
+                    line = sys.stdin.readline()
+                    if line == "":            # EOF (Ctrl-D): stop taking marks
+                        stdin_tty = False
+                    else:
+                        _stamp(line.strip() or "mark")
+            b = recv_frame(s, timeout=0.2)
+            if b:
+                gap = time.time() - last_rx
+                last_rx = time.time()
+                if gap > 10.0:
+                    print("  ~~~ quiet for %.1fs ~~~" % gap)
+                f = log_frame("<-", b)
+                if not f:
+                    continue
+                role, ccmd, sseq = f["fields"][2], f["fields"][3], f["fields"][1]
+                rc = (role, ccmd)
+                counts[rc] = counts.get(rc, 0) + 1
+                _check_expected(f)
+                p = pending.get(sseq)
+                if p is not None and p[0] == ccmd:
+                    pending.pop(sseq, None)
+                    if rc != (ROLE_MCU_AX, 0x25):
+                        print("      ^ reply to our %s" % p[1])
+                else:
+                    initiated[rc] = initiated.get(rc, 0) + 1
+                    print("  *** MCU-INITIATED: role=%02X cmd=%02X ***" % rc)
+            if poll and time.time() - last_poll >= poll:
+                q = seq & 0xFF
+                seq = (q + 1) & 0xFF
+                pending[q] = (0x25, "cmd25 poll")
+                tx(s, build_frame(q, ROLE_MOD, STEADY_REQ[0], STEADY_REQ[1]),
+                   "status cmd25 %s seq=%02X" % (_d(STEADY_REQ[1]), q))
+                last_poll = time.time()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    print("\n=== MANUAL SUMMARY ===")
+    print("  incoming (role,cmd):count   [MCU-init = not a reply to us]")
+    for rc, n in sorted(counts.items()):
+        tag = "   [MCU-init x%d]" % initiated[rc] if rc in initiated else ""
+        print("    role=%02X cmd=%02X  x%-3d%s" % (rc[0], rc[1], n, tag))
+    for now, label in marks:
+        print("  MARK t=%7.1fs  '%s'" % (now - t0, label))
+    if not initiated:
+        print("  -> No MCU-initiated frames: the MCU only replied to our requests.")
+        print("     If the bolt moved by hand, the post-mark cmd07 readouts (and the")
+        print("     LED) are the only state signal -- the MCU may be silent on manual ops.")
+
 class Tee:
     """Write to both the live console stream and a log file. The console stream
     keeps its own line-buffering, so output stays live; the file is flushed on
@@ -734,11 +846,11 @@ def main():
     sub.add_parser("calibrate").add_argument("files", nargs="+")
     sub.add_parser("verify").add_argument("files", nargs="+")
     parsers = {}
-    for m in ("sniff","emulate","act","lock","unlock"):
+    for m in ("sniff","emulate","act","lock","unlock","manual"):
         p = sub.add_parser(m)
         p.add_argument("-p","--port",required=True)
         p.add_argument("--swap",action="store_true")
-        p.add_argument("--seconds",type=int,default=30)
+        p.add_argument("--seconds",type=int,default=(120 if m=="manual" else 30))
         p.add_argument("-v","--verbose",action="store_true",
                        help="log every frame: timestamp + CRC ok/BAD (+ raw unframed bytes)")
         p.add_argument("--after",choices=["hello","cmd09"],default="cmd09",
@@ -776,6 +888,10 @@ def main():
                         help="track = next-available SEQ (fixes stale-seq); capture = capture-3 SEQs; zero = 0x00")
         pm.add_argument("--poll",type=float,default=2.0,
                         help="seconds between periodic cmd25 status reports during the test (0 = quiet baseline)")
+    pman = parsers["manual"]
+    pman.add_argument("--poll",type=float,default=2.0,
+                      help="seconds between periodic cmd25 status reports (0 = fully quiet listen; "
+                           "the session may idle out -- the hello retry loop would then be visible)")
     a = ap.parse_args()
     if getattr(a, "log", None):
         logpath = a.log
@@ -804,12 +920,15 @@ def main():
         try:
             if a.cmd=="sniff": sniff(s, a.seconds)
             elif a.cmd=="emulate": emulate(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll_every=a.poll)
+            elif a.cmd=="manual": manual(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll)
             elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles=a.roles, frames=_parse_frames(a.frames))
             elif a.cmd in ("lock","unlock"):
                 c = 0x03 if a.cmd == "lock" else 0x05
+                st = (0x01, "LOCKED") if a.cmd == "lock" else (0x02, "unlocked")
                 act(s, seconds=a.seconds, settle=a.settle, mode="cluster", seqmode=a.seq,
                     hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles="e7",
-                    frames=[_cluster_idx(c)], label="%s (cmd%02X)" % (a.cmd.upper(), c))
+                    frames=[_cluster_idx(c)], label="%s (cmd%02X)" % (a.cmd.upper(), c),
+                    confirm_state=st)
         except KeyboardInterrupt:
             print("\nstopped")
         s.close()
