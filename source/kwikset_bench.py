@@ -282,6 +282,12 @@ EXPECTED = {
 def _d(data):
     return " ".join("%02X" % x for x in data) or "-"
 
+# cmd07 reply data byte -> human state (bench board: 01 locked / 02 unlocked;
+# the capture board replies 00). Shared by _check_expected and _confirm_state.
+STATE_WORDS = {0x01: "LOCKED", 0x02: "unlocked"}
+def _state_word(b):
+    return STATE_WORDS.get(b, "unknown")
+
 def send_reqs(s, seq):
     """Transmit our module request sequence (all role=E7). Returns next free SEQ."""
     for cmd, data in REQS:
@@ -305,8 +311,7 @@ def _check_expected(f):
     info, never as a mismatch."""
     cmd, role, data = f["fields"][3], f["fields"][2], f["fields"][4:]
     if cmd == 0x07:
-        state = {0x01: "LOCKED", 0x02: "unlocked"}.get(
-            data[0] if data else None, "unknown")
+        state = _state_word(data[0] if data else None)
         print("      ^ cmd07 reply data=%s -> lock state: %s" % (_d(data), state))
         return
     exp = EXPECTED.get(cmd)
@@ -563,14 +568,52 @@ def _print_act_summary(baseline, post):
         print("     sent no distinct frame). Note: the validated trigger direction")
         print("     is --roles e7 (module->MCU); as-captured 55/AA are ignored.")
 
+# Post-command state confirmation (confidence reps). After a lock/unlock command
+# the motor settles when the MCU emits its async motor-complete (55 cmd2A); we
+# then poll cmd07 and read the state byte back, comparing it to the state we
+# commanded. Timing: prefer the motor-complete + a short settle; if the (flaky)
+# complete never arrives, fall back to a fixed post-injection wait.
+CONFIRM_SETTLE   = 1.0    # s after the motor-complete before reading state
+CONFIRM_FALLBACK = 10.0   # s after injection if no complete is seen (bench motor
+                          # completes ~3-4 s; the capture board's ~10.5 s is the
+                          # conservative reference)
+
+def _confirm_state(s, seq, retries=3, per_retry=2.0):
+    """Send a cmd07 status poll and read the state byte back, retrying if the MCU
+    skips the reply (known flaky, 3 samples). Returns (state_byte or None,
+    next_seq). cmd07 is a read (role E7) and never actuates."""
+    for attempt in range(1, retries + 1):
+        q = seq & 0xFF
+        seq = (seq + 1) & 0xFF
+        tx(s, build_frame(q, ROLE_MOD, 0x07, []),
+           "CONFIRM cmd07 seq=%02X (attempt %d/%d)" % (q, attempt, retries))
+        start = time.time()
+        while time.time() - start < per_retry:
+            b = recv_frame(s, timeout=0.5)
+            if not b:
+                continue
+            f = log_frame("<-", b)
+            if not f:
+                continue
+            if f["fields"][2] == ROLE_MCU_AX and f["fields"][3] == 0x07:
+                data = f["fields"][4:]
+                if data:
+                    return data[0], seq
+                # no data byte yet; keep waiting this attempt
+    return None, seq
+
 def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
         hello_timeout=15.0, after="cmd09", poll=2.0, roles="as-captured",
-        frames=None, label=None):
+        frames=None, label=None, confirm_state=None):
     what = label if label is not None else (mode if frames is None else "subset %s" % frames)
     print("Act (corrected direction): handshake, then inject %s (roles=%s) after "
           "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
           % (what, roles, settle, seqmode, poll))
     print("  Watch for: a BEEP + any *** NEW *** post-injection frame + the lock itself.")
+    if confirm_state:
+        print("  CONFIRM: after the motor settles it polls cmd07 and reports the state")
+        print("  readback vs the commanded state (%s) -- PASS/FAIL at the end."
+              % confirm_state[1])
     print("  MODEL (bench 11-16/17 + captures, both directions confirmed):")
     print("  cmd03 = LOCK, cmd05 = UNLOCK (absolute; each motor-runs even when")
     print("  already in state). cmd09/cmd07/cmd2A/cmd4E are dialogue/ack-only.")
@@ -582,9 +625,28 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
     settle_at = time.time() + settle
     last_poll = 0.0
     injected = False
+    inject_time = 0.0
+    saw_complete = False
+    complete_time = 0.0
+    confirmed = False
     max_seq = 0x00
     baseline = {}      # (role,cmd) -> count, seen BEFORE the injection
     post = {}          # (role,cmd) -> count, seen AFTER the injection
+
+    def _do_confirm():
+        """Read the state back once the motor has settled; report PASS/FAIL."""
+        nonlocal confirmed, seq
+        print("\n>>> === CONFIRM: reading state back (cmd07) ===")
+        state, seq = _confirm_state(s, seq)
+        if state is None:
+            print("  ==> CONFIRM: no cmd07 reply -> INCONCLUSIVE (trust the bolt + LED)")
+        else:
+            ok = (state == confirm_state[0])
+            print("  ==> RESULT: read data=%s -> %s   [%s]   (commanded %s)"
+                  % (_d([state]), _state_word(state),
+                     "PASS" if ok else "FAIL", confirm_state[1]))
+        confirmed = True
+
     try:
         while time.time() < end:
             b = recv_frame(s, timeout=1.0)
@@ -596,10 +658,14 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
                     bucket[rc] = bucket.get(rc, 0) + 1
                     max_seq = max(max_seq, f["fields"][1])     # fields[1] = SEQ
                     _check_expected(f)
-                    if injected and rc not in baseline:
-                        print("    *** NEW post-injection frame: role=%02X cmd=%02X" % rc)
-                    elif injected and rc[0] == ROLE_MCU_CMD:
-                        print("    (55 async frame, post-injection)")
+                    if injected:
+                        if rc == (ROLE_MCU_CMD, 0x2A) and not saw_complete:
+                            saw_complete = True               # motor-complete seen
+                            complete_time = time.time()
+                        if rc not in baseline:
+                            print("    *** NEW post-injection frame: role=%02X cmd=%02X" % rc)
+                        elif rc[0] == ROLE_MCU_CMD:
+                            print("    (55 async frame, post-injection)")
             # keep steady state calm: periodic module status report (E7 cmd25)
             if poll and time.time() - last_poll >= poll:
                 rcmd, rd = STEADY_REQ
@@ -613,8 +679,18 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
                 _inject(s, mode, seqmode, max_seq, roles, frames)
                 print(">>> === POST-INJECTION WATCH: listen for a BEEP ===\n")
                 injected = True
+                inject_time = time.time()
+            # confidence rep: once the motor settles, read the state back
+            if confirm_state and injected and not confirmed:
+                due = (saw_complete and time.time() - complete_time >= CONFIRM_SETTLE) \
+                      or (time.time() - inject_time >= CONFIRM_FALLBACK)
+                if due:
+                    _do_confirm()
     except KeyboardInterrupt:
         pass
+    # best effort: if the loop ended before the confirm fired, run it once
+    if confirm_state and injected and not confirmed:
+        _do_confirm()
     _print_act_summary(baseline, post)
 
 def sniff(s, seconds=30):
