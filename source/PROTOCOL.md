@@ -200,6 +200,7 @@ ground truth.
 | `07` | status poll | — | `AA cmd07` + 1 state byte | pure read, never actuates |
 | `08` | (undecoded) | — | `AA cmd08 00` | handshake step |
 | `09` | (undecoded) | — | `AA cmd09 46` (bench) / `5A` (capture) | see §5 |
+| `12` | dipswitch settings query (GET) | — | `AA cmd12` + bitmask byte (§7.3) | Z-Wave param 31 pass-through; GET-only |
 | `25` | module status report | `27 00` (steady state) | `AA cmd25` (empty) | periodic; capture also saw `29 00`, `2A 00` — undecoded |
 | `30` | (undecoded) | — | `55 cmd30 03` (bench) / `AA 01` (capture) | handshake step |
 | `35` | config | — | `16 × 0x20` (capture) / **none** (bench) | handshake step |
@@ -217,12 +218,41 @@ boot**, and the ~12 s `cmd4E` answer to the `cmd09 5A` prompt.
 | `AA` | `07` | state reply | `01` / `02` (bench); `00` (capture) | state readout (§8) |
 | `AA` | `08` | reply | `00` | |
 | `AA` | `09` | reply | `46` (bench) / `5A` (capture) | capture's `5A` is a **prompt** |
+| `AA` | `12` | dipswitch settings reply | 1 bitmask byte (§7.3) | Z-Wave param 31 pass-through; GET-only |
 | `AA` | `25` | status ack | (empty) | ack of our `cmd25` |
 | `AA` | `30` | reply | `01` (capture) | bench replies `55 03` |
 | `AA` | `03` / `05` | echo-ack | — | ~60 ms after motor-complete (capture); flaky on bench (2/8) |
 | `AA` | `4E` | ack | `04` (capture) | ack of our `cmd4E` prompt answer |
 | `55` | `2A` | **motor-complete** | `15 FF` (bench) / `14` (capture) | async; ~3–4 s after actuation (bench), ~10.5 s (capture, incl. no-ops) |
 | `55` | `30` | reply | `03` (bench) | |
+
+### 7.3 Dipswitch settings (`cmd12` reply byte)
+
+The `AA cmd12` reply carries one **bitmask** byte. Cross-referenced against
+Kwikset's own Z-Wave documentation (SmartCode 914 manual, cert ZC10-18106261):
+this is **Configuration parameter 31 "Dipswitch settings"** — read-only,
+factory default `5`. The Z-Wave JS UI exposes it as **GET-only** (no SET), so
+the UART `cmd12` is that same GET pass-through: the module queries (no data),
+the MCU answers with the current dipswitch image. (The user's controller also
+shows class 112, Manufacturer Specific; Kwikset's docs place param 31 under
+Configuration, 113 — the bit semantics match either way.) The dip switches are
+on the **lock's rear panel**, not on the module.
+
+| Bit | Value | Setting (per Kwikset Z-Wave docs) |
+|---:|---:|---|
+| 0 | `0x01` | Lock Status LED |
+| 1 | `0x02` | Autolock |
+| 2 | `0x04` | Buzzer |
+| 3 | `0x08` | Secure Screen / handing invert (model-dependent) |
+
+**Evidence** (capture class; `captures/lock-status-led-dip-switch.csv`, Nov 19
+22:15 UTC): the real module sent two **mid-session** `E7 cmd12` GETs (no data;
+SEQ `0D`/`0E`) — triggered by a **parameter refresh from the Z-Wave JS UI**
+(controller-driven, not module-scheduled) — and the MCU answered `AA cmd12`
+with data `00` then `01` (12–18 ms, SEQ echoed, zero `cmd25` in the window).
+The `00` → `01` transition matches the user toggling the Lock Status LED
+switch off → on. A bench read of `cmd12` (harness `poll --settings`) is the
+next validation step.
 
 ## 8. State readout (`cmd07` reply data byte)
 
@@ -308,6 +338,14 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
    prompt on the new board.
 10. Old-capture-rig caveat: if its wiring was crossed, the channel re-reading
     (§4 provenance) flips.
+11. Does a `cmd12` **with data** (a SET) exist on the UART? The Z-Wave side is
+    GET-only (param 31 is read-only; the Z-Wave JS UI exposes no SET), but
+    nothing positively rules out a UART-level SET.
+12. `cmd25` activity gating: in the cmd12 capture the real module sent **zero**
+    `cmd25` reports across a 17 s mid-session window — is the module's
+    `cmd25` activity gated on nearby activity rather than a fixed ~2 s
+    cadence? A longer post-boot capture is planned to check whether the
+    activity quiesces.
 
 ## 15. Harness cross-reference (`kwikset_bench.py`)
 
@@ -318,6 +356,7 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
 | `act` | injection tests (`--mode`, `--frames`, `--roles e7`, `--seq`, `--poll`) |
 | `lock` / `unlock` | drive one absolute state command + state readback confirm (PASS/FAIL) |
 | `manual` | capture what the MCU transmits on hand/key operation |
+| `poll` | handshake, then read state (`cmd07`) every `--interval` s and flag changes; `--keepalive` (`cmd25`) keeps the session alive; `--settings` also reads the dipswitch settings (`cmd12`, §7.3) each cycle |
 | `calibrate` / `verify` | CRC model against captures |
 
 Flags: `-p PORT`, `-v` (timestamps + CRC ok/BAD + raw), `--after hello|cmd09`,
