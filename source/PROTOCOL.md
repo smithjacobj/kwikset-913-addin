@@ -233,7 +233,9 @@ Kwikset's own Z-Wave documentation (SmartCode 914 manual, cert ZC10-18106261):
 this is **Configuration parameter 31 "Dipswitch settings"** — read-only,
 factory default `5`. The Z-Wave JS UI exposes it as **GET-only** (no SET), so
 the UART `cmd12` is that same GET pass-through: the module queries (no data),
-the MCU answers with the current dipswitch image. (The user's controller also
+the MCU answers with the current dipswitch image. A SET makes no sense at any
+level: the value is the position of a **physical** switch, changeable only by
+hand — a hardware-state readout, not a stored setting. (The user's controller also
 shows class 112, Manufacturer Specific; Kwikset's docs place param 31 under
 Configuration, 113 — the bit semantics match either way.) The dip switches are
 on the **lock's rear panel**, not on the module.
@@ -338,10 +340,7 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
    prompt on the new board.
 10. Old-capture-rig caveat: if its wiring was crossed, the channel re-reading
     (§4 provenance) flips.
-11. Does a `cmd12` **with data** (a SET) exist on the UART? The Z-Wave side is
-    GET-only (param 31 is read-only; the Z-Wave JS UI exposes no SET), but
-    nothing positively rules out a UART-level SET.
-12. `cmd25` activity gating: in the cmd12 capture the real module sent **zero**
+11. `cmd25` activity gating: in the cmd12 capture the real module sent **zero**
     `cmd25` reports across a 17 s mid-session window — is the module's
     `cmd25` activity gated on nearby activity rather than a fixed ~2 s
     cadence? A longer post-boot capture is planned to check whether the
