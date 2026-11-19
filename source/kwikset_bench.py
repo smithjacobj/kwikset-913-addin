@@ -251,6 +251,18 @@ def open_port(path, baud=9600, swap=False):
 # command set + SEQ-echo, but board-specific payloads (see EXPECTED below). The
 # CSV's old hardcoded values (id 04 00 36 0D, cmd09 5A, cmd30 01/AA, cmd35
 # 16x20) do NOT match this board and are gone.
+# 19th re-reading of the captures (by CSV channel names): the primer's
+# "known-good sample frames" had the two channel blocks SWAPPED. TXD1 (from
+# the MCU) carries the hello, the AA replies, the config block, the cmd25
+# acks, the cmd09 5A prompt, the 55 cmd2A motor-completes, and the AA
+# echo-acks; RXD1 (to the MCU) carries the module's entire E7 request
+# sequence (cmd02 x3, cmd07/08/09, cmd35, cmd30, cmd25 reports 27/29/2A 00,
+# the cmd4E answer) and its actuation (E7 cmd03/cmd05, both, target last,
+# cmd07 polls interleaved). So the two revisions speak the SAME role model:
+# the "direction flip" was the primer's mislabel, not a revision difference
+# (plausibility: the motor-complete sits on the hello's channel, i.e. the
+# side with the motor). Caveat: a re-reading of the channel labels -- if the
+# old capture rig had crossed wiring, this flips.
 # =====================================================================
 ROLE_MOD    = 0xE7   # module -> MCU : requests (what WE send)
 ROLE_MCU_AX = 0xAA   # MCU -> module : responses to our requests
@@ -260,6 +272,10 @@ ROLE_MCU_CMD= 0x55   # MCU -> module : initiated commands / async events
 MCU_HELLO = (0xAA, 0x18, [0x00])
 
 # Our request sequence (all role=E7), sent once at handshake. (cmd, data)
+# Gold reference (the capture's RXD1 = the module's real behavior): it sent
+# cmd02 THREE times at boot, then cmd07/08/09, cmd35, cmd30, and ~12 s in it
+# answered the MCU's cmd09 5A prompt with a cmd4E. Neither the boot-time
+# cmd02 repeat nor the cmd4E answer is emulated here (open: do they matter?).
 REQS = [
     (0x02, []),               # readID
     (0x07, []),
@@ -275,7 +291,15 @@ STEADY_REQ = (0x25, [0x27, 0x00])
 # Validation/logging only — the 913 sends these, we don't. (No 0x35 entry: this
 # board does not reply to the config request.)
 EXPECTED = {
-    0x02: (0xAA, [0x08, 0x00, 0x45, 0x01]),  # ID/cap blob (board-specific)
+    0x02: (0xAA, [0x08, 0x00, 0x45, 0x01]),  # ID/cap blob (board-specific; the
+                           # capture board was 04 00 36 0D). 19th: the real
+                           # old-revision Z-Wave module paired with THIS board
+                           # goes BAREBONES -- excluded/re-included, the
+                           # interview exposes only basic config/info classes,
+                           # no lock classes (it appears to reject the unknown
+                           # board; ID-blob fingerprint is the top suspect).
+                           # No effect on our DIY add-in (no such rejection
+                           # logic) -- data point.
     # 0x07: state-dependent -- handled in _check_expected (01 locked /
     # 02 unlocked on this bench board; the capture board replies 00).
     0x08: (0xAA, [0x00]),
@@ -378,7 +402,15 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
 # =====================================================================
 # ACTUATION CLUSTER
 # =====================================================================
-# Actuation frames from the CSV capture (different board revision).
+# Actuation frames transcribed from the CSV captures. PROVENANCE (19th
+# re-reading, see the PROTOCOL MODEL note): the as-captured roles below are
+# the capture's TXD1 channel = the MCU's OWN frames (the prompt, the acks,
+# the motor-completes, the state-cmd echo-acks) -- replaying them as-is is
+# the 16th negative A/B (the MCU ignores non-requests). The module's genuine
+# actuation frames (the RXD1 E7 sequence: cmd03/cmd05, both, target last,
+# cmd07 polls interleaved) were never transcribed here; bisection "found"
+# cmd03 because the MCU's AA echo of it is byte-identical to the module's
+# E7 cmd03 once roles are corrected.
 #
 # LIVE-VALIDATED 2026-11-16/17 (bench 913, each test starting UNLOCKED):
 #   * --roles as-captured (original 55/AA bytes): the MCU ignored everything
