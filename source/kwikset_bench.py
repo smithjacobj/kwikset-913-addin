@@ -279,7 +279,11 @@ EXPECTED = {
     # 0x07: state-dependent -- handled in _check_expected (01 locked /
     # 02 unlocked on this bench board; the capture board replies 00).
     0x08: (0xAA, [0x00]),
-    0x09: (0xAA, [0x46]),
+    0x09: (0xAA, [0x46]),  # in-dialogue reply. The MCU-initiated BOOT prefix
+                           # cmd09 byte varies instead: 3C (18th 10:37) and 50
+                           # (18th 11:29, unstable/low-battery boots), 46 (18th
+                           # 14:13, low batteries), 64 (18th 14:52-15:02, fresh
+                           # batteries). Undecoded; no effect on actuation.
     0x30: (0x55, [0x03]),
     0x25: (0xAA, []),
 }
@@ -289,6 +293,12 @@ def _d(data):
 
 # cmd07 reply data byte -> human state (bench board: 01 locked / 02 unlocked;
 # the capture board replies 00). Shared by _check_expected and _confirm_state.
+# 00 "unknown" = no conclusive closed-loop state: observed on the bench board
+# in the 11-18 10:35/36 unstable/low-battery runs, where the motor apparently
+# stalled short of full travel (user's hypothesis: no end-stop -> no
+# conclusive state). The 18th 14:14 INCONCLUSIVE (MCU skipped all 3 confirm
+# replies) is likely the same condition expressed as silence. Never seen with
+# fresh batteries (5/5 clean readouts the 18th afternoon).
 STATE_WORDS = {0x01: "LOCKED", 0x02: "unlocked"}
 def _state_word(b):
     return STATE_WORDS.get(b, "unknown")
@@ -434,8 +444,24 @@ def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
 #     the next boot).
 #   * BENCH motor-complete = 55 cmd2A data 15 FF (~3-4 s after actuation;
 #     2 samples: 10:43 pair run, 13:37 cmd05) vs the capture board's
-#     55 cmd2A data 14 at ~10.5 s. Status LED stays OFF after our bench
-#     commands (real module keeps it blinking) -- noted, not chased.
+#     55 cmd2A data 14 at ~10.5 s. It was absent in ALL 8 afternoon 18th
+#     runs -- the confirm then runs via the CONFIRM_FALLBACK path and still
+#     PASSES. Status LED stays OFF after our bench commands (real module
+#     keeps it blinking); re-confirmed 18th on the healthy unit -- it
+#     returns to blinking only after PHYSICAL (key) manipulation. Noted,
+#     still deferred.
+#   * CONFIDENCE RE-VALIDATION (18th afternoon, fresh batteries, better-
+#     assembled unit): 5/5 PASS -- 14:52 unlock reseat (02), 14:53 lock
+#     (02->01), 14:54 unlock (01->02), 14:54 lock (02->01), 15:02 lock
+#     (02->01). Every confirm reply on attempt 1/3; every handshake readout
+#     consistent with the previous run's end state (state survives a
+#     power-cycle). The 10:35/10:36 FAILs (readback 02, then 00 "unknown")
+#     were low-battery/unstable-state artifacts: the motor apparently stalled
+#     short of full travel, so the closed-loop readout had no conclusive
+#     state (00 "unknown", or silence; see the STATE_WORDS note). Same-day
+#     low-battery runs: 14:13 PASS (no-op reseat), 14:14 INCONCLUSIVE (MCU
+#     skipped all 3 confirm replies -- likely the same condition, expressed
+#     as silence), 14:50 total silence (no boot prefix at all).
 #   => cmd07 = status poll; its reply data byte is the state readout on the
 #      bench board (01 locked / 02 unlocked; the capture board replies 00).
 #
