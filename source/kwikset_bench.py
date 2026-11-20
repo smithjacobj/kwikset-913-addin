@@ -13,7 +13,11 @@ the MCU transmits when the lock is operated BY HAND -- the key path the Z-Wave
 add-in board will also have to react to), poll (handshake, then read the lock
 state via cmd07 every N seconds -- the add-in's detection model in running
 form; --settings also reads the dipswitch settings bitmask via cmd12, the
-UART form of Z-Wave parameter 31), calibrate/verify (CRC vs captures)."""
+UART form of Z-Wave parameter 31; --with-poke pokes while waiting for the
+prefix, for a lock that was NOT power-cycled), poke (no handshake:
+repeatedly send our E7 request sequence + cmd07 + cmd12 and listen for ANY
+reply -- the wake probe for a possibly-deaf MCU; bench 11-20: a deaf MCU
+answers cmd08/cmd09 only), calibrate/verify (CRC vs captures)."""
 import argparse, sys, os, struct, time
 
 # ---------- CRC-8 (parametric, reflected/non-reflected) ----------
@@ -380,15 +384,43 @@ def _check_expected(f):
         print("      ^^ MISMATCH cmd%02X: want role=%02X data=%s, got role=%02X data=%s"
               % (cmd, e_role, _d(e_data), role, _d(data)))
 
-def _wait_prefix(s, timeout=15.0, after="cmd09"):
+def poke_round(s, seq, label="POKE"):
+    """Send one poke round: our full E7 request sequence (REQS) plus a cmd07
+    state poll and a cmd12 settings GET. Returns the next free SEQ. Shared by
+    the standalone `poke` subcommand and the --with-poke prefix wait."""
+    for cmd, data in REQS:
+        tx(s, build_frame(seq, ROLE_MOD, cmd, data),
+           "%s cmd%02X %s seq=%02X" % (label, cmd, _d(data), seq))
+        seq = (seq + 1) & 0xFF
+    tx(s, build_frame(seq, ROLE_MOD, 0x07, []),
+       "%s cmd07 state poll seq=%02X" % (label, seq))
+    seq = (seq + 1) & 0xFF
+    tx(s, build_frame(seq, ROLE_MOD, 0x12, []),
+       "%s cmd12 settings seq=%02X" % (label, seq))
+    return (seq + 1) & 0xFF
+
+def _wait_prefix(s, timeout=15.0, after="cmd09", poke_interval=0.0):
     """Wait for the 913's boot prefix. The MCU INITIATES: it transmits the hello
     (AA cmd18), then a cmd09 retry frame, and re-sends the pair every ~2.6 s
-    (SEQ resets to 01) until it gets a valid module answer. Returns True when
-    the requested sync point (`after`: 'hello' or 'cmd09') is seen within
-    `timeout`. Every frame is logged (verbose-aware) as it arrives."""
+    (SEQ resets to 01) until it gets a valid module answer. Every frame is
+    logged (verbose-aware) as it arrives. Returns (how, seq):
+      'prefix'  the requested sync point (`after`: 'hello' or 'cmd09') was seen.
+      'poke'    --with-poke is on and the MCU answered a poke's cmd07 state
+                poll (a session was established without a prefix -- the poke
+                round already carried our full E7 request sequence).
+      None      timeout; the replies seen while waiting are tallied for the
+                deaf-state diagnostic (PROTOCOL.md 14.12: a post-autolock deaf
+                MCU answers cmd08/cmd09 only).
+    seq is the next free SEQ after the pokes sent (0x01 if none)."""
     saw = {"hello": False, "cmd09": False}
+    replies = {}
+    seq = 0x01
     start = time.time()
+    last_poke = start
     while time.time() - start < timeout:
+        if poke_interval and time.time() - last_poke >= poke_interval:
+            seq = poke_round(s, seq, "POKE (prefix wait)")
+            last_poke = time.time()
         b = recv_frame(s, timeout=1.0)
         if not b:
             continue
@@ -396,25 +428,58 @@ def _wait_prefix(s, timeout=15.0, after="cmd09"):
         if not f:
             continue
         role, cmd = f["fields"][2], f["fields"][3]
+        data = f["fields"][4:]
+        if role == ROLE_MCU_AX:
+            replies[cmd] = replies.get(cmd, 0) + 1
+            if poke_interval and cmd == 0x07 and data:
+                return ("poke", seq)
         if role == ROLE_MCU_AX and cmd == 0x18:
             saw["hello"] = True
         if role == ROLE_MCU_AX and cmd == 0x09:
             saw["cmd09"] = True
         if (after == "hello" and saw["hello"]) or \
            (after == "cmd09" and saw["hello"] and saw["cmd09"]):
-            return True
-    return False
+            return ("prefix", seq)
+    if replies:
+        got = ", ".join("cmd%02X x%d" % (c, n) for c, n in sorted(replies.items()))
+        print("  no prefix, but the MCU answered while waiting: %s" % got)
+        if set(replies) <= {0x08, 0x09}:
+            print("  -> that is the post-autolock 'deaf' state (PROTOCOL.md 14.12):")
+            print("     the MCU answers cmd08/cmd09 only. Power-cycle the 913 to recover.")
+    return (None, seq)
 
-def _do_handshake(s, hello_timeout=15.0, after="cmd09"):
+def _do_handshake(s, hello_timeout=15.0, after="cmd09", poke_interval=0.0):
     """Corrected handshake: wait for the MCU's prefix, then transmit our E7
     request sequence. Returns the next free SEQ, or None if no prefix was seen
-    (e.g. the enable pin is not driven High)."""
+    (e.g. the enable pin is not driven High). With poke_interval > 0
+    (--with-poke), the prefix wait is active: a poke round is sent every
+    poke_interval seconds, so a lock that was NOT power-cycled (no prefix
+    expected) still gets probed; a re-sent prefix or a cmd07 answer both
+    start the session."""
     want = "hello" if after == "hello" else "hello+cmd09"
     print("Waiting for the 913's boot prefix (%s)..." % want)
-    if not _wait_prefix(s, timeout=hello_timeout, after=after):
-        print("No prefix in %.0fs. Is the enable pin tied High and the 913 power-cycled?" % hello_timeout)
-        print("  (the boot prefix is sent ONLY at power-on: power-cycle AFTER this script started)")
+    if poke_interval:
+        print("  --with-poke: poking (E7 sequence + cmd07 + cmd12) every %.0fs while waiting."
+              % poke_interval)
+    how, pseq = _wait_prefix(s, timeout=hello_timeout, after=after,
+                             poke_interval=poke_interval)
+    if how is None:
+        if poke_interval:
+            print("No prefix in %.0fs (poked while waiting). Power-cycle the 913 and"
+                  % hello_timeout)
+            print("  re-run -- or check the adapter/wiring if it never replied at all.")
+        else:
+            print("No prefix in %.0fs. Is the enable pin tied High and the 913 power-cycled?"
+                  % hello_timeout)
+            print("  (the boot prefix is sent ONLY at power-on: power-cycle AFTER this script started)")
         return None
+    if how == "poke":
+        print("Session established via poke (the MCU answered our cmd07 request; no prefix).")
+        return pseq
+    if pseq != 0x01:
+        print("Prefix seen -> transmitting our E7 request sequence (SEQ resumes at %02X after the pokes)."
+              % pseq)
+        return send_reqs(s, pseq)
     print("Prefix seen -> transmitting our E7 request sequence.")
     return send_reqs(s, 0x01)     # 913 echoes our SEQ in replies (match probe_e7.py)
 
@@ -548,11 +613,13 @@ def recv_frame(s, timeout=2.0):
                 return list(buf[:need])
     return list(buf) if buf and buf[0]==0xBD else None
 
-def emulate(s, seconds=30, hello_timeout=15.0, after="cmd09", poll_every=2.0):
+def emulate(s, seconds=30, hello_timeout=15.0, after="cmd09", poll_every=2.0,
+            poke_interval=0.0):
     print("Emulate (corrected direction): wait for the 913's prefix, send our E7 "
           "request sequence, then log its replies and send periodic cmd25 status "
           "reports for %ds. Ctrl-C to stop." % seconds)
-    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
+    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after,
+                        poke_interval=poke_interval)
     if seq is None:
         return
     end = time.time() + seconds
@@ -711,7 +778,7 @@ def _read_settings(s, seq, retries=2, per_retry=1.0):
 
 def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
         hello_timeout=15.0, after="cmd09", poll=2.0, roles="as-captured",
-        frames=None, label=None, confirm_state=None):
+        frames=None, label=None, confirm_state=None, poke_interval=0.0):
     what = label if label is not None else (mode if frames is None else "subset %s" % frames)
     print("Act (corrected direction): handshake, then inject %s (roles=%s) after "
           "%ds settle (seq=%s, poll=%ss). Ctrl-C to stop."
@@ -725,7 +792,8 @@ def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
     print("  cmd03 = LOCK, cmd05 = UNLOCK (absolute; each motor-runs even when")
     print("  already in state). cmd09/cmd07/cmd2A/cmd4E are dialogue/ack-only.")
     print("  cmd07 reply data byte = state readout (01 locked / 02 unlocked).")
-    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
+    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after,
+                        poke_interval=poke_interval)
     if seq is None:
         return
     end = time.time() + seconds
@@ -826,14 +894,16 @@ def sniff(s, seconds=30):
 # Start this script FIRST, then power-cycle the lock (boot prefix is power-on
 # only). --poll 0 = fully quiet listen (the session may idle out -- the hello
 # retry loop would then be visible as MCU-initiated).
-def manual(s, seconds=120, hello_timeout=15.0, after="cmd09", poll=2.0):
+def manual(s, seconds=120, hello_timeout=15.0, after="cmd09", poll=2.0,
+           poke_interval=0.0):
     print("Manual-op capture: handshake, then listen %ds while you operate the lock by hand."
           % seconds)
     print("  As you FINISH a manual op, type a label (e.g. 'lock'/'unlock') + Enter:")
     print("  -> a MARK line is stamped and we poll cmd07 once (the state the MCU believes).")
     print("  Frames we did not request are flagged *** MCU-INITIATED *** (event candidates).")
     print("  Note the LED too (ground truth): green blink = unlocked, amber = locked.")
-    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
+    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after,
+                        poke_interval=poke_interval)
     if seq is None:
         return
     select = None
@@ -932,7 +1002,7 @@ def manual(s, seconds=120, hello_timeout=15.0, after="cmd09", poll=2.0):
 # read-only, factory default 5) and flags changes the same way. See
 # PROTOCOL.md 7.3.
 def poll(s, seconds=300, interval=5.0, keepalive=2.0, settings=False,
-         hello_timeout=15.0, after="cmd09"):
+         hello_timeout=15.0, after="cmd09", poke_interval=0.0):
     print("State poll: handshake, then read state (cmd07) every %.1fs for %ds "
           "(cmd25 keepalive every %.1fs). Ctrl-C to stop." % (interval, seconds, keepalive))
     print("  Readout: 01=LOCKED 02=unlocked 00=unknown. Unknown/no-reply is treated")
@@ -941,7 +1011,8 @@ def poll(s, seconds=300, interval=5.0, keepalive=2.0, settings=False,
         print("  --settings: each cycle also reads the dipswitch settings (cmd12 = Z-Wave")
         print("  param 31, read-only) and flags changes: 01=Lock Status LED 02=Autolock")
         print("  04=Buzzer 08=Secure Screen (model-dependent); factory default 5.")
-    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
+    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after,
+                        poke_interval=poke_interval)
     if seq is None:
         return
     # Drain the handshake replies still queued (ID blob, the boot-time state
@@ -1022,6 +1093,76 @@ def poll(s, seconds=300, interval=5.0, keepalive=2.0, settings=False,
                  ("%02X = %s" % (last_settings, _decode_settings(last_settings & SETTINGS_MASK)))
                  if last_settings is not None else "never read"))
 
+# =====================================================================
+# POKE / WAKE PROBE  (no handshake: what does a deaf MCU still answer?)
+# =====================================================================
+# For the post-autolock deafness (PROTOCOL.md 14.12). Bench 11-20 (two
+# episodes -- a fresh autolock, and 17.5 h of silence): the deaf MCU is
+# NOT fully deaf. Poked WITHOUT a handshake it answers exactly two
+# frames, `AA cmd08 00` + `AA cmd09 64`, and ignores cmd02/cmd07/cmd12/
+# cmd25/cmd30/cmd35. A poke round (our full E7 sequence + cmd07 + cmd12)
+# does NOT restore the full command set, and 17.5 h of silence did not
+# recover it either; the only recovery observed is a power cycle (the
+# boot prefix is sent at power-on only). So poke TRIAGES: a
+# cmd08/cmd09-only reply = the deaf state (power cycle to recover); a
+# full cmd07/cmd12 answer = merely idle, not deaf; total silence = a
+# fully silent MCU or a dead bench adapter RX (a power-cycle run
+# discriminates: prefix appears -> MCU recovered, adapter fine).
+def poke(s, rounds=10, interval=3.0, listen=2.0):
+    print("Poke (no handshake): %d rounds of our E7 request sequence + cmd07 + "
+          "cmd12, %.1fs apart, listening %.1fs each round for ANY reply. "
+          "Ctrl-C to stop." % (rounds, interval, listen))
+    t0 = time.time()
+    seq = 0x01
+    woke = False
+    saw = {}
+    try:
+        for r in range(1, rounds + 1):
+            seq = poke_round(s, seq, "POKE r%02d" % r)
+            start = time.time()
+            got = 0
+            while time.time() - start < listen:
+                b = recv_frame(s, timeout=0.5)
+                if not b:
+                    continue
+                f = log_frame("<-", b)
+                if f:
+                    got += 1
+                    c = f["fields"][3]
+                    saw[c] = saw.get(c, 0) + 1
+                    _check_expected(f)
+            if got and not woke:
+                woke = True
+                print("  >>> WAKE: first reply in round %d (t=%.1fs): %d frame(s)"
+                      % (r, time.time() - t0, got))
+                break
+            if r < rounds:
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nstopped")
+    if woke:
+        got = ", ".join("cmd%02X x%d" % (c, n) for c, n in sorted(saw.items()))
+        print("\n=== POKE SUMMARY ===")
+        if set(saw) <= {0x08, 0x09}:
+            print("  DEAF STATE: the MCU answered %s -- the post-autolock 'deaf'"
+                  % got)
+            print("  signature (PROTOCOL.md 14.12): it answers cmd08/cmd09 only,")
+            print("  and a poke does NOT restore the full command set.")
+            print("  Power-cycle the 913 to recover -- or keep probing with")
+            print("  `poll --with-poke`: it pokes every 3s and will start the session")
+            print("  if a full answer (or a power-on prefix) arrives; on timeout it")
+            print("  re-prints this triage.")
+        else:
+            print("  WOKEN: the MCU answered %s -- the full command set, i.e." % got)
+            print("  merely idle, not deaf. Re-run a normal handshake (lock/unlock/")
+            print("  poll) for a healthy session.")
+    else:
+        print("\n=== POKE SUMMARY ===")
+        print("  no reply in any round: the MCU (or the bench adapter's RX) is")
+        print("  fully silent. Power-cycle the 913 and re-run: prefix seen ->")
+        print("  MCU recovered (asleep/crashed, needs a power cycle); still")
+        print("  silent -> check the adapter/wiring.")
+
 class Tee:
     """Write to both the live console stream and a log file. The console stream
     keeps its own line-buffering, so output stays live; the file is flushed on
@@ -1054,7 +1195,7 @@ def main():
     sub.add_parser("calibrate").add_argument("files", nargs="+")
     sub.add_parser("verify").add_argument("files", nargs="+")
     parsers = {}
-    for m in ("sniff","emulate","act","lock","unlock","manual","poll"):
+    for m in ("sniff","emulate","act","lock","unlock","manual","poll","poke"):
         p = sub.add_parser(m)
         p.add_argument("-p","--port",required=True)
         p.add_argument("--swap",action="store_true")
@@ -1067,6 +1208,12 @@ def main():
                             "'hello' = after frame one")
         p.add_argument("--hello-timeout",type=int,default=15,
                        help="seconds to wait for the 913's boot prefix before giving up")
+        p.add_argument("--with-poke",action="store_true",
+                       help="while waiting for the boot prefix, send a poke round (our E7 "
+                            "request sequence + cmd07 + cmd12) every 3s instead of sitting "
+                            "idle -- for a lock that was NOT power-cycled (no prefix expected); "
+                            "on timeout, the replies seen distinguish 'fully silent' from the "
+                            "post-autolock deaf state (cmd08/cmd09 only; PROTOCOL.md 14.12)")
         p.add_argument("--log",nargs="?",const="auto",default=None,metavar="FILE",
                        help="tee all output to a log file: bare --log = logs/<mode>_TIMESTAMP.log, "
                             "--log FILE = explicit path")
@@ -1111,6 +1258,13 @@ def main():
                        help="each cycle also read the dipswitch settings (cmd12 = Z-Wave param 31, "
                             "read-only) and flag changes: 01=Lock Status LED 02=Autolock 04=Buzzer "
                             "08=Secure Screen (model-dependent)")
+    ppoke = parsers["poke"]
+    ppoke.add_argument("--rounds",type=int,default=10,
+                       help="number of poke rounds (each = our E7 request sequence + cmd07 + cmd12)")
+    ppoke.add_argument("--interval",type=float,default=3.0,
+                       help="seconds between rounds (after the listen window)")
+    ppoke.add_argument("--listen",type=float,default=2.0,
+                       help="seconds to listen for replies after each round")
     a = ap.parse_args()
     if getattr(a, "log", None):
         logpath = a.log
@@ -1135,20 +1289,22 @@ def main():
                 if f: print("  " + frame_text(f))
     else:
         VERBOSE = a.verbose
+        poke_iv = 3.0 if a.with_poke else 0.0
         s = open_port(a.port, swap=a.swap)
         try:
             if a.cmd=="sniff": sniff(s, a.seconds)
-            elif a.cmd=="emulate": emulate(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll_every=a.poll)
-            elif a.cmd=="manual": manual(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll)
-            elif a.cmd=="poll": poll(s, seconds=a.seconds, interval=a.interval, keepalive=a.keepalive, settings=a.settings, hello_timeout=a.hello_timeout, after=a.after)
-            elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles=a.roles, frames=_parse_frames(a.frames))
+            elif a.cmd=="emulate": emulate(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll_every=a.poll, poke_interval=poke_iv)
+            elif a.cmd=="manual": manual(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, poke_interval=poke_iv)
+            elif a.cmd=="poll": poll(s, seconds=a.seconds, interval=a.interval, keepalive=a.keepalive, settings=a.settings, hello_timeout=a.hello_timeout, after=a.after, poke_interval=poke_iv)
+            elif a.cmd=="poke": poke(s, rounds=a.rounds, interval=a.interval, listen=a.listen)
+            elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles=a.roles, frames=_parse_frames(a.frames), poke_interval=poke_iv)
             elif a.cmd in ("lock","unlock"):
                 c = 0x03 if a.cmd == "lock" else 0x05
                 st = (0x01, "LOCKED") if a.cmd == "lock" else (0x02, "unlocked")
                 act(s, seconds=a.seconds, settle=a.settle, mode="cluster", seqmode=a.seq,
                     hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles="e7",
                     frames=[_cluster_idx(c)], label="%s (cmd%02X)" % (a.cmd.upper(), c),
-                    confirm_state=st)
+                    confirm_state=st, poke_interval=poke_iv)
         except KeyboardInterrupt:
             print("\nstopped")
         s.close()
