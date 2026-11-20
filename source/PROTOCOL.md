@@ -253,8 +253,10 @@ SEQ `0D`/`0E`) — triggered by a **parameter refresh from the Z-Wave JS UI**
 (controller-driven, not module-scheduled) — and the MCU answered `AA cmd12`
 with data `00` then `01` (12–18 ms, SEQ echoed, zero `cmd25` in the window).
 The `00` → `01` transition matches the user toggling the Lock Status LED
-switch off → on. A bench read of `cmd12` (harness `poll --settings`) is the
-next validation step.
+switch off → on. **Bench-confirmed** (Nov 19 16:00, `poll --settings`): the
+bench board answers `cmd12` with the same bitmask (~15 ms); two mid-run
+dipswitch flips tracked as `01 → 03 → 07` (LED; +Autolock; +Buzzer). That
+same run then surfaced the post-autolock UART deafness (§14.12).
 
 ## 8. State readout (`cmd07` reply data byte)
 
@@ -286,6 +288,10 @@ State **survives a power-cycle** (bolt position + MCU belief both persist).
 - **Capture (Nov 18, two runs): the MCU is completely silent on manual ops** —
   zero MCU-initiated frames; state appears only in response to **our** `cmd07`
   requests.
+- **Bench (Nov 19): an internally-triggered action (autolock, §14.12) is
+  equally frameless** — the MCU broadcast no motor-complete for it. It sends
+  no motor events for any non-module-initiated action (key *or* its own
+  logic); state changes surface only via our `cmd07` polls.
 - **Add-in detection design:** periodic `cmd07` polling + diffing. Treat `00`
   as *"unknown — no state change"* and **never** as a new state (a weak-battery
   stall must not register as a phantom toggle).
@@ -345,6 +351,20 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
     `cmd25` activity gated on nearby activity rather than a fixed ~2 s
     cadence? A longer post-boot capture is planned to check whether the
     activity quiesces.
+12. **Post-autolock UART deafness** (bench, Nov 19 16:00, `poll --settings`
+    run): ~23–30 s after the Autolock switch was turned on (the flip landed
+    between our 16:00:15 and 16:00:20 reads), the MCU stopped answering
+    **everything** — no `cmd07`/`cmd12` replies, no `cmd25` acks, no 55
+    motor-complete for the autolock, no boot-prefix re-send; ≥80 s of
+    silence. It was alive at the last instant before (it batched out two
+    stale `cmd25` acks just before going quiet), and every one of our frames
+    stayed CRC-clean — polite silence, not a link-layer desync. Not yet
+    separated: MCU deep-sleep/crash vs the bench USB-serial adapter's RX
+    dying — a power-cycle run discriminates (prefix appears ⇒ MCU recovered,
+    adapter fine). Add-in implication: the `cmd07`-diff detection model has a
+    hole for internally-triggered state changes that coincide with deafness;
+    a wake probe (re-handshake without power cycle) is the planned next
+    experiment.
 
 ## 15. Harness cross-reference (`kwikset_bench.py`)
 
