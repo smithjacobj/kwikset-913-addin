@@ -288,10 +288,13 @@ State **survives a power-cycle** (bolt position + MCU belief both persist).
 - **Capture (Nov 18, two runs): the MCU is completely silent on manual ops** —
   zero MCU-initiated frames; state appears only in response to **our** `cmd07`
   requests.
-- **Bench (Nov 19): an internally-triggered action (autolock, §14.12) is
-  equally frameless** — the MCU broadcast no motor-complete for it. It sends
-  no motor events for any non-module-initiated action (key *or* its own
-  logic); state changes surface only via our `cmd07` polls.
+- **Bench (Nov 19, reproduced Nov 20): an internally-triggered action
+  (autolock, §14.12) is equally frameless** — the MCU broadcast no
+  motor-complete for it. It sends no motor events for any
+  non-module-initiated action (key *or* its own logic); state changes
+  surface only via our `cmd07` polls. Catch: the Nov 20 autolock went deaf
+  (§14.12) within ~15 s of locking, so the `cmd07` polls never saw that
+  state change at all.
 - **Add-in detection design:** periodic `cmd07` polling + diffing. Treat `00`
   as *"unknown — no state change"* and **never** as a new state (a weak-battery
   stall must not register as a phantom toggle).
@@ -351,20 +354,39 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
     `cmd25` activity gated on nearby activity rather than a fixed ~2 s
     cadence? A longer post-boot capture is planned to check whether the
     activity quiesces.
-12. **Post-autolock UART deafness** (bench, Nov 19 16:00, `poll --settings`
-    run): ~23–30 s after the Autolock switch was turned on (the flip landed
-    between our 16:00:15 and 16:00:20 reads), the MCU stopped answering
-    **everything** — no `cmd07`/`cmd12` replies, no `cmd25` acks, no 55
-    motor-complete for the autolock, no boot-prefix re-send; ≥80 s of
+12. **Post-autolock UART deafness** (bench; first observed Nov 19 16:00
+    `poll --settings` run, **reproduced Nov 20** — refined below).
+    Nov 19: ~23–30 s after the Autolock switch was turned on, the MCU stopped
+    answering **everything** — no `cmd07`/`cmd12` replies, no `cmd25` acks,
+    no 55 motor-complete for the autolock, no boot-prefix re-send; ≥80 s of
     silence. It was alive at the last instant before (it batched out two
     stale `cmd25` acks just before going quiet), and every one of our frames
-    stayed CRC-clean — polite silence, not a link-layer desync. Not yet
-    separated: MCU deep-sleep/crash vs the bench USB-serial adapter's RX
-    dying — a power-cycle run discriminates (prefix appears ⇒ MCU recovered,
-    adapter fine). Add-in implication: the `cmd07`-diff detection model has a
-    hole for internally-triggered state changes that coincide with deafness;
-    a wake probe (re-handshake without power cycle) is the planned next
-    experiment.
+    stayed CRC-clean — polite silence, not a link-layer desync.
+    Nov 20 (two episodes: a fresh autolock — bolt move observed 09:37:30.685,
+    replies die within ~15 s — and 17.5 h of silence since the Nov 19
+    episode):
+    - The deaf MCU is **not fully deaf**: poked WITHOUT a handshake (`poke`)
+      it answers exactly `AA cmd08 00` + `AA cmd09 64` and nothing else
+      (`cmd02`/`cmd07`/`cmd12`/`cmd25`/`cmd30`/`cmd35` ignored) — the
+      identical 2-frame pair in both episodes.
+    - A poke (our full E7 sequence + `cmd07` + `cmd12`) does **NOT** restore
+      the full command set, and 17.5 h of silence did not recover it either.
+    - **Only observed recovery: a power cycle** (Nov 20 09:36:52 run: prefix,
+      full session, state `01`, settings `03`). The 09:36:55 prefix was the
+      user's power cycle (confirmed) — the prefix is sent **at power-on
+      only**; no spontaneous re-send.
+    - This RESOLVES the Nov 19 adapter-vs-MCU question: the bench adapter
+      delivers (the frames were received) and the MCU is alive (it sent
+      them) ⇒ MCU-side **selective command processing**. What that state
+      actually is (reduced ISR? sleep mode? watchdog?) is still open, and
+      whether a key op recovers a deaf MCU is untested.
+    - Add-in implications: (a) the `cmd07`-diff detection model has a hole
+      for internally-triggered state changes that coincide with deafness
+      (the autolock's own LOCK is invisible to it — the Nov 20 lock was
+      first seen via the bolt, not the UART); (b) the add-in is powered
+      from the lock (cannot power-cycle it) → detect the
+      cmd08/cmd09-only signature on a poke and **flag the condition**
+      rather than acting on silence.
 
 ## 15. Harness cross-reference (`kwikset_bench.py`)
 
@@ -375,16 +397,31 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
 | `act` | injection tests (`--mode`, `--frames`, `--roles e7`, `--seq`, `--poll`) |
 | `lock` / `unlock` | drive one absolute state command + state readback confirm (PASS/FAIL) |
 | `manual` | capture what the MCU transmits on hand/key operation |
-| `poll` | handshake, then read state (`cmd07`) every `--interval` s and flag changes; `--keepalive` (`cmd25`) keeps the session alive; `--settings` also reads the dipswitch settings (`cmd12`, §7.3) each cycle |
+| `poll` | handshake, then read state (`cmd07`) every `--interval` s and flag changes; `--keepalive` (`cmd25`) keeps the session alive; `--settings` also reads the dipswitch settings (`cmd12`, §7.3) each cycle; `--with-poke` makes the prefix wait active (below) |
+| `poke` | NO handshake: N rounds of our E7 request sequence + `cmd07` + `cmd12` with a listen window between rounds — the deaf-state triage probe (bench 11-20: a deaf MCU answers `cmd08`/`cmd09` only, §14.12) |
 | `calibrate` / `verify` | CRC model against captures |
 
 Flags: `-p PORT`, `-v` (timestamps + CRC ok/BAD + raw), `--after hello|cmd09`,
-`--hello-timeout N`, `--log [FILE]` (tee to `logs/<mode>_TIMESTAMP.log`).
+`--hello-timeout N`, `--with-poke` (all handshake modes: poke every 3 s while
+waiting for the prefix — for a lock that was NOT power-cycled; a cmd07 answer
+or a power-on prefix both start the session; on timeout the replies seen
+distinguish "fully silent" from the deaf state), `--log [FILE]` (tee to
+`logs/<mode>_TIMESTAMP.log`).
 Typical confidence run:
 
 ```
 ../.venv/bin/python kwikset_bench.py lock -p /dev/tty.usbserial-AB0LPKC3 \
     -v --hello-timeout 120 --log
+```
+
+Deaf-lock triage (diagnosis needs no power cycle; recovery is the power
+cycle — §14.12):
+
+```
+../.venv/bin/python kwikset_bench.py poke -p /dev/tty.usbserial-AB0LPKC3 \
+    -v --log
+../.venv/bin/python kwikset_bench.py poll -p /dev/tty.usbserial-AB0LPKC3 \
+    -v --with-poke --settings --log
 ```
 
 **Run workflow reminder:** start the script first, then power-cycle the 913
