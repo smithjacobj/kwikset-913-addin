@@ -285,15 +285,18 @@ State **survives a power-cycle** (bolt position + MCU belief both persist).
 | low-battery behavior | — | `00` readout, skipped replies, or no boot prefix at all |
 | real Z-Wave module pairing | worked | **barebones** (§11) |
 
-## 10. Manual (key) operation
+## 10. Manual operation (key or thumbturn)
 
 - **Capture (Nov 18, two runs): the MCU is completely silent on manual ops** —
   zero MCU-initiated frames; state appears only in response to **our** `cmd07`
-  requests.
+  requests. **Bench (Nov 20, 09:36:52 run): the same silence on the interior
+  thumbturn** — the user's manual unlock (user-confirmed thumbturn, §14.12)
+  produced no MCU-initiated frames; the state change surfaced only via our
+  `cmd07` polls (as delayed replies).
 - **Bench (Nov 19, reproduced Nov 20): an internally-triggered action
   (autolock, §14.12) is equally frameless** — the MCU broadcast no
   motor-complete for it. It sends no motor events for any
-  non-module-initiated action (key *or* its own logic); state changes
+  non-module-initiated action (key, thumbturn *or* its own logic); state changes
   surface only via our `cmd07` polls. Catch: the Nov 20 autolock went deaf
   (§14.12) within ~15 s of locking, so the `cmd07` polls never saw that
   state change at all.
@@ -369,7 +372,7 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
     power cycle at 09:36:55 (confirmed) ended the Nov 19 deafness (17.5 h of
     silence); the lock booted LOCKED (the bolt keeps its position) with
     settings `03` (Autolock still on). The user then **manually unlocked**
-    (user-confirmed manual operation; no exact time — the state reads bound
+    (user-confirmed: interior thumbturn; no exact time — the state reads bound
     it to 09:36:55.7 < t < 09:37:04.1: the handshake drain read `01` at
     09:36:55.727 and the first `02` read arrived at 09:37:04.108). With the
     autolock armed, the lock **auto-locked again at 09:37:30.685** (bolt
@@ -405,7 +408,7 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
       delivers (the frames were received) and the MCU is alive (it sent
       them) ⇒ MCU-side **selective command processing**. What that state
       actually is (reduced ISR? sleep mode? watchdog?) is still open, and
-      whether a key op recovers a deaf MCU is untested.
+      whether a key *or thumbturn* op recovers a deaf MCU is untested.
     - Add-in implications: (a) the `cmd07`-diff detection model has a hole
       for internally-triggered state changes that coincide with deafness
       (the autolock's own LOCK is invisible to it — the Nov 20 lock was
@@ -431,7 +434,7 @@ Package layout (all under `source/`):
 | `kwikset_bench/modes/sniff.py` | passive listen |
 | `kwikset_bench/modes/emulate.py` | full module steady state (handshake + periodic `cmd25`) |
 | `kwikset_bench/modes/act.py` | `inject()` + frame-spec parsing, `read_state`/`read_settings`, `act()` (the target `lock`/`unlock` map onto) |
-| `kwikset_bench/modes/manual.py` | capture what the MCU transmits on hand/key operation |
+| `kwikset_bench/modes/manual.py` | capture what the MCU transmits on hand operation (key or thumbturn) |
 | `kwikset_bench/modes/poll.py` | state (+ optionally `--settings`) polling, keepalive, `--with-poke` |
 | `kwikset_bench/modes/poke.py` | deaf-state triage probe (§14.12) |
 | `kwikset_bench/modes/calibrate.py` | CRC model calibration / verification |
@@ -449,7 +452,7 @@ Subcommand behavior:
 | `emulate` | full module steady state (handshake + periodic `cmd25`) |
 | `act` | injection tests (`--mode`, `--frames`, `--roles e7`, `--seq`, `--poll`) |
 | `lock` / `unlock` | drive one absolute state command + state readback confirm (PASS/FAIL) |
-| `manual` | capture what the MCU transmits on hand/key operation |
+| `manual` | capture what the MCU transmits on hand operation (key or thumbturn) |
 | `poll` | handshake, then read state (`cmd07`) every `--interval` s and flag changes; `--keepalive` (`cmd25`) keeps the session alive; `--settings` also reads the dipswitch settings (`cmd12`, §7.3) each cycle; `--with-poke` makes the prefix wait active (below) |
 | `poke` | NO handshake: N rounds of our E7 request sequence + `cmd07` + `cmd12` with a listen window between rounds — the deaf-state triage probe (bench 11-20: a deaf MCU answers `cmd08`/`cmd09` only, §14.12) |
 | `calibrate` / `verify` | CRC model against captures |
