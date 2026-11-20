@@ -7,7 +7,9 @@ pin map is in `hardware/`, where J* designators on other sheets can be ignored).
 **Status: bench-validated.** Every item below was confirmed on a live bench
 board (ID blob `08 00 45 01`) and cross-checked against the old-revision
 captures (`captures/*.csv`, board ID `04 00 36 0D`). Confidence re-validation:
-**5/5 PASS** (Nov 18, fresh batteries). Companion harness: `kwikset_bench.py`.
+**5/5 PASS** (Nov 18, fresh batteries). Companion harness: the `kwikset_bench`
+package in `source/kwikset_bench/` (the top-level `kwikset_bench.py` is now a
+thin shim over it — see §15).
 
 Evidence classes used throughout:
 
@@ -388,7 +390,34 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
       cmd08/cmd09-only signature on a poke and **flag the condition**
       rather than acting on silence.
 
-## 15. Harness cross-reference (`kwikset_bench.py`)
+## 15. Harness cross-reference (`kwikset_bench` package)
+
+Package layout (all under `source/`):
+
+| File | Contents |
+|---|---|
+| `kwikset_bench.py` | 13-line shim — the original `kwikset_bench.py <mode> ...` invocation keeps working unchanged |
+| `kwikset_bench/__main__.py` | `python -m kwikset_bench` entry point (same CLI) |
+| `kwikset_bench/cli.py` | argparse wiring for every subcommand (`lock`/`unlock` map onto `act()`) |
+| `kwikset_bench/crc.py` | CRC-8 implementation (§3: poly `0x80` reflected, init `0xFF`, xorout `0x00`) + table builder |
+| `kwikset_bench/frames.py` | `build_frame`/`split_frame`/`frame_text`, CSV capture parsing + reconstruction (the `calibrate`/`verify` data path) |
+| `kwikset_bench/protocol.py` | ALL protocol constants (roles, `REQS`, `EXPECTED`, `STEADY_REQ`, `ACT_CLUSTER`, `STATE_WORDS`, `SETTINGS_MASK`, boot prefix) + decoders (`fmt_data`, `state_word`, `decode_settings`), each with its provenance comment |
+| `kwikset_bench/link.py` | transport: `VERBOSE`, timestamps, CRC validation, `log_frame`/`tx`/`recv_frame`, `--log` Tee, `open_port` |
+| `kwikset_bench/handshake.py` | `send_reqs`/`check_expected`/`poke_round`/`wait_prefix`/`do_handshake` |
+| `kwikset_bench/modes/sniff.py` | passive listen |
+| `kwikset_bench/modes/emulate.py` | full module steady state (handshake + periodic `cmd25`) |
+| `kwikset_bench/modes/act.py` | `inject()` + frame-spec parsing, `read_state`/`read_settings`, `act()` (the target `lock`/`unlock` map onto) |
+| `kwikset_bench/modes/manual.py` | capture what the MCU transmits on hand/key operation |
+| `kwikset_bench/modes/poll.py` | state (+ optionally `--settings`) polling, keepalive, `--with-poke` |
+| `kwikset_bench/modes/poke.py` | deaf-state triage probe (§14.12) |
+| `kwikset_bench/modes/calibrate.py` | CRC model calibration / verification |
+
+The old monolith's private names were de-underscored where they became the
+public API (e.g. `_confirm_state` → `read_state`, `_wait_prefix` →
+`wait_prefix`, `_do_handshake` → `do_handshake`, `_install_tee` →
+`install_tee`); behavior is unchanged.
+
+Subcommand behavior:
 
 | Subcommand | Purpose |
 |---|---|
@@ -427,12 +456,18 @@ cycle — §14.12):
 **Run workflow reminder:** start the script first, then power-cycle the 913
 (the boot prefix is sent only at power-on).
 
+Tests: `source/tests/` holds the plain-assert, no-hardware suites (no
+pytest) that drive the real mode functions against fake MCUs; `tests/` is
+a namespace package, so from `source/` either works:
+`../.venv/bin/python -m tests.test_poll` or
+`../.venv/bin/python tests/test_poll.py` (see `tests/README.md`).
+
 ## 16. Known harness gaps
 
 - `recv_frame` has no `SerialException` tolerance (a dropped USB serial
   connection raises instead of logging).
 - `ACT_CLUSTER` still transcribes the capture's MCU-side frames (provenance in
-  `kwikset_bench.py`); `lock`/`unlock` use `--frames <idx>` to inject the
+  `kwikset_bench/protocol.py`); `lock`/`unlock` use `--frames <idx>` to inject the
   genuine E7 trigger, so the cluster is only a bisection/`act` convenience now.
 - Stdin MARK path in `manual` never exercised live (optional verification run
   is on the table).
