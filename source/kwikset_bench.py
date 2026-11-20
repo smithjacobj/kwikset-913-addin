@@ -10,7 +10,10 @@ section below for the full corrected role model.
 Subcommands: sniff (passive listen), emulate (module steady state), act
 (injection test), lock/unlock (drive one absolute state), manual (capture what
 the MCU transmits when the lock is operated BY HAND -- the key path the Z-Wave
-add-in board will also have to react to), calibrate/verify (CRC vs captures)."""
+add-in board will also have to react to), poll (handshake, then read the lock
+state via cmd07 every N seconds -- the add-in's detection model in running
+form; --settings also reads the dipswitch settings bitmask via cmd12, the
+UART form of Z-Wave parameter 31), calibrate/verify (CRC vs captures)."""
 import argparse, sys, os, struct, time
 
 # ---------- CRC-8 (parametric, reflected/non-reflected) ----------
@@ -326,6 +329,22 @@ def _d(data):
 STATE_WORDS = {0x01: "LOCKED", 0x02: "unlocked"}
 def _state_word(b):
     return STATE_WORDS.get(b, "unknown")
+
+# cmd12 reply data byte -> dipswitch settings bitmask. Cross-reference
+# (Kwikset's own Z-Wave docs, SmartCode 914 manual): Configuration parameter
+# 31 "Dipswitch settings", READ-ONLY, factory default 5. The Z-Wave JS UI
+# exposes it as GET-only; the UART cmd12 is that same GET pass-through
+# (module queries with no data, MCU answers with the current dipswitch
+# image). The dip switches are on the lock's rear panel, not on the module.
+# See PROTOCOL.md 7.3.
+SETTINGS_BITS = {0x01: "Lock Status LED",
+                 0x02: "Autolock",
+                 0x04: "Buzzer",
+                 0x08: "Secure Screen (model-dependent)"}
+SETTINGS_MASK = 0x0F
+def _decode_settings(b):
+    names = [v for k, v in SETTINGS_BITS.items() if b & k]
+    return ", ".join(names) if names else "(all known bits off)"
 
 def send_reqs(s, seq):
     """Transmit our module request sequence (all role=E7). Returns next free SEQ."""
@@ -665,6 +684,31 @@ def _confirm_state(s, seq, retries=3, per_retry=2.0):
                 # no data byte yet; keep waiting this attempt
     return None, seq
 
+def _read_settings(s, seq, retries=2, per_retry=1.0):
+    """Send a cmd12 dipswitch-settings GET (no data) and read the reply byte
+    back, retrying if the MCU skips the reply. Returns (byte or None,
+    next_seq). Read-only: the reply is the settings bitmask, never an
+    actuation (PROTOCOL.md 7.3)."""
+    for attempt in range(1, retries + 1):
+        q = seq & 0xFF
+        seq = (seq + 1) & 0xFF
+        tx(s, build_frame(q, ROLE_MOD, 0x12, []),
+           "SETTINGS cmd12 seq=%02X (attempt %d/%d)" % (q, attempt, retries))
+        start = time.time()
+        while time.time() - start < per_retry:
+            b = recv_frame(s, timeout=0.5)
+            if not b:
+                continue
+            f = log_frame("<-", b)
+            if not f:
+                continue
+            if f["fields"][2] == ROLE_MCU_AX and f["fields"][3] == 0x12:
+                data = f["fields"][4:]
+                if data:
+                    return data[0], seq
+                # no data byte yet; keep waiting this attempt
+    return None, seq
+
 def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
         hello_timeout=15.0, after="cmd09", poll=2.0, roles="as-captured",
         frames=None, label=None, confirm_state=None):
@@ -872,6 +916,112 @@ def manual(s, seconds=120, hello_timeout=15.0, after="cmd09", poll=2.0):
         print("     If the bolt moved by hand, the post-mark cmd07 readouts (and the")
         print("     LED) are the only state signal -- the MCU may be silent on manual ops.")
 
+# =====================================================================
+# STATE POLLING  (handshake, then read state every N seconds)
+# =====================================================================
+# The add-in's manual-op detection model in running form: handshake, then
+# periodically poll cmd07 (a pure read -- it never actuates) and read the
+# state byte back, flagging changes. Per the add-in design: 00 / no-reply =
+# "unknown -- no state change"; it is NEVER treated as a new state (a
+# weak-battery stall must not register as a phantom toggle). A periodic
+# cmd25 keepalive keeps the session alive (the MCU can idle out; see
+# manual --poll). Ctrl-C to stop.
+#
+# --settings additionally reads the dipswitch settings each cycle (cmd12 GET,
+# no data -- the UART form of Z-Wave parameter 31 "Dipswitch settings",
+# read-only, factory default 5) and flags changes the same way. See
+# PROTOCOL.md 7.3.
+def poll(s, seconds=300, interval=5.0, keepalive=2.0, settings=False,
+         hello_timeout=15.0, after="cmd09"):
+    print("State poll: handshake, then read state (cmd07) every %.1fs for %ds "
+          "(cmd25 keepalive every %.1fs). Ctrl-C to stop." % (interval, seconds, keepalive))
+    print("  Readout: 01=LOCKED 02=unlocked 00=unknown. Unknown/no-reply is treated")
+    print("  as 'no state change' -- never as a new state.")
+    if settings:
+        print("  --settings: each cycle also reads the dipswitch settings (cmd12 = Z-Wave")
+        print("  param 31, read-only) and flags changes: 01=Lock Status LED 02=Autolock")
+        print("  04=Buzzer 08=Secure Screen (model-dependent); factory default 5.")
+    seq = _do_handshake(s, hello_timeout=hello_timeout, after=after)
+    if seq is None:
+        return
+    # Drain the handshake replies still queued (ID blob, the boot-time state
+    # readout, ...) so the first timed poll is a fresh cmd07 we sent.
+    print("Draining handshake replies...")
+    while True:
+        b = recv_frame(s, timeout=1.0)
+        if not b:
+            break
+        f = log_frame("<-", b)
+        if f:
+            _check_expected(f)
+    t0 = time.time()
+    end = t0 + seconds
+    next_poll = next_keep = t0
+    last_state = None
+    last_settings = None
+    polls = changes = schanges = 0
+    try:
+        while time.time() < end:
+            now = time.time()
+            if now >= next_poll:
+                next_poll = now + interval
+                polls += 1
+                state, seq = _confirm_state(s, seq)
+                if state is None:
+                    print("  [t=%6.1fs] no cmd07 reply -> unknown (no state change)"
+                          % (now - t0))
+                elif state in STATE_WORDS:
+                    word = _state_word(state)
+                    if last_state is None:
+                        print("  [t=%6.1fs] state: %s  (initial readout)" % (now - t0, word))
+                    elif state != last_state:
+                        changes += 1
+                        print("  [t=%6.1fs] *** STATE CHANGE: %s -> %s ***"
+                              % (now - t0, _state_word(last_state), word))
+                    else:
+                        print("  [t=%6.1fs] state: %s  (unchanged)" % (now - t0, word))
+                    last_state = state
+                else:
+                    print("  [t=%6.1fs] state byte %s -> unknown (no state change)"
+                          % (now - t0, _d([state])))
+                if settings:
+                    sbyte, seq = _read_settings(s, seq)
+                    if sbyte is None:
+                        print("  [t=%6.1fs] settings: no cmd12 reply -> unknown (no change)"
+                              % (now - t0))
+                    else:
+                        dec = _decode_settings(sbyte & SETTINGS_MASK)
+                        if last_settings is None:
+                            print("  [t=%6.1fs] settings: %02X = %s  (initial readout)"
+                                  % (now - t0, sbyte, dec))
+                        elif sbyte != last_settings:
+                            schanges += 1
+                            print("  [t=%6.1fs] *** SETTINGS CHANGE: %02X (%s) -> %02X (%s) ***"
+                                  % (now - t0, last_settings,
+                                     _decode_settings(last_settings & SETTINGS_MASK),
+                                     sbyte, dec))
+                        else:
+                            print("  [t=%6.1fs] settings: %02X = %s  (unchanged)"
+                                  % (now - t0, sbyte, dec))
+                        last_settings = sbyte
+            if keepalive and now >= next_keep:
+                next_keep = now + keepalive
+                tx(s, build_frame(seq, ROLE_MOD, STEADY_REQ[0], STEADY_REQ[1]),
+                   "status cmd25 %s seq=%02X (keepalive)" % (_d(STEADY_REQ[1]), seq))
+                seq = (seq + 1) & 0xFF
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        print("\nstopped")
+    print("\n=== POLL SUMMARY ===")
+    print("  polls: %d   state changes: %d   final state: %s"
+          % (polls, changes,
+             _state_word(last_state) if last_state is not None else "never read"))
+    if settings:
+        print("  settings changes: %d   final settings: %s"
+              % (schanges,
+                 ("%02X = %s" % (last_settings, _decode_settings(last_settings & SETTINGS_MASK)))
+                 if last_settings is not None else "never read"))
+
 class Tee:
     """Write to both the live console stream and a log file. The console stream
     keeps its own line-buffering, so output stays live; the file is flushed on
@@ -904,11 +1054,12 @@ def main():
     sub.add_parser("calibrate").add_argument("files", nargs="+")
     sub.add_parser("verify").add_argument("files", nargs="+")
     parsers = {}
-    for m in ("sniff","emulate","act","lock","unlock","manual"):
+    for m in ("sniff","emulate","act","lock","unlock","manual","poll"):
         p = sub.add_parser(m)
         p.add_argument("-p","--port",required=True)
         p.add_argument("--swap",action="store_true")
-        p.add_argument("--seconds",type=int,default=(120 if m=="manual" else 30))
+        p.add_argument("--seconds",type=int,
+                       default=(120 if m=="manual" else 300 if m=="poll" else 30))
         p.add_argument("-v","--verbose",action="store_true",
                        help="log every frame: timestamp + CRC ok/BAD (+ raw unframed bytes)")
         p.add_argument("--after",choices=["hello","cmd09"],default="cmd09",
@@ -950,6 +1101,16 @@ def main():
     pman.add_argument("--poll",type=float,default=2.0,
                       help="seconds between periodic cmd25 status reports (0 = fully quiet listen; "
                            "the session may idle out -- the hello retry loop would then be visible)")
+    ppoll = parsers["poll"]
+    ppoll.add_argument("--interval",type=float,default=5.0,
+                       help="seconds between cmd07 state polls")
+    ppoll.add_argument("--keepalive",type=float,default=2.0,
+                       help="seconds between cmd25 keepalive reports (0 = disable; the session "
+                            "may idle out -- the hello retry loop would then be visible)")
+    ppoll.add_argument("--settings",action="store_true",
+                       help="each cycle also read the dipswitch settings (cmd12 = Z-Wave param 31, "
+                            "read-only) and flag changes: 01=Lock Status LED 02=Autolock 04=Buzzer "
+                            "08=Secure Screen (model-dependent)")
     a = ap.parse_args()
     if getattr(a, "log", None):
         logpath = a.log
@@ -979,6 +1140,7 @@ def main():
             if a.cmd=="sniff": sniff(s, a.seconds)
             elif a.cmd=="emulate": emulate(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll_every=a.poll)
             elif a.cmd=="manual": manual(s, seconds=a.seconds, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll)
+            elif a.cmd=="poll": poll(s, seconds=a.seconds, interval=a.interval, keepalive=a.keepalive, settings=a.settings, hello_timeout=a.hello_timeout, after=a.after)
             elif a.cmd=="act": act(s, seconds=a.seconds, settle=a.settle, mode=a.mode, seqmode=a.seq, hello_timeout=a.hello_timeout, after=a.after, poll=a.poll, roles=a.roles, frames=_parse_frames(a.frames))
             elif a.cmd in ("lock","unlock"):
                 c = 0x03 if a.cmd == "lock" else 0x05
