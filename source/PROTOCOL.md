@@ -357,22 +357,46 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
     cadence? A longer post-boot capture is planned to check whether the
     activity quiesces.
 12. **Post-autolock UART deafness** (bench; first observed Nov 19 16:00
-    `poll --settings` run, **reproduced Nov 20** — refined below).
+    `poll --settings` run, **reproduced Nov 20 — three episodes total** —
+    refined below).
     Nov 19: ~23–30 s after the Autolock switch was turned on, the MCU stopped
     answering **everything** — no `cmd07`/`cmd12` replies, no `cmd25` acks,
     no 55 motor-complete for the autolock, no boot-prefix re-send; ≥80 s of
     silence. It was alive at the last instant before (it batched out two
     stale `cmd25` acks just before going quiet), and every one of our frames
     stayed CRC-clean — polite silence, not a link-layer desync.
-    Nov 20 (two episodes: a fresh autolock — bolt move observed 09:37:30.685,
-    replies die within ~15 s — and 17.5 h of silence since the Nov 19
-    episode):
+    Nov 20, recovery of episode 1 + episode 2 (the 09:36:52 run): the user's
+    power cycle at 09:36:55 (confirmed) ended the Nov 19 deafness (17.5 h of
+    silence); the lock booted LOCKED (the bolt keeps its position) with
+    settings `03` (Autolock still on). The user then **manually unlocked**
+    (user-confirmed manual operation; no exact time — the state reads bound
+    it to 09:36:55.7 < t < 09:37:04.1: the handshake drain read `01` at
+    09:36:55.727 and the first `02` read arrived at 09:37:04.108). With the
+    autolock armed, the lock **auto-locked again at 09:37:30.685** (bolt
+    move; UART `01` at 09:37:30.803) — an unlock→autolock delay of **≈ 26–35
+    s** (the earlier loose 2.7–34.7 s estimate had used the 09:37:27.98
+    `02` read as the unlock time; that read is a *delayed* reply to an
+    earlier poll, not a new state, so it does not tighten the window). Both
+    days' windows (Nov 19: ~23–30 s after the Autolock switch was turned on
+    while the lock was unlocked; Nov 20: 26–35 s after the manual unlock)
+    bracket a ~30 s autolock delay from the last unlock. After this fresh
+    autolock the MCU went deaf again (episode 2): `cmd07` replies stopped at
+    once, `cmd25` acks died ~5 s later, the last `cmd12` reply arrived 15 s
+    late, then full silence.
+    Nov 20, still deaf ~1.5 h later (the 11:11:29 run, `poll --with-poke
+    --settings --log`; no power cycle): no prefix; 4 pokes went out every
+    3 s and **3 of 4 answered** the deaf signature `AA cmd08 00` +
+    `AA cmd09 64` (the 11:11:39.99 poke drew no reply at all) — the
+    signature is not 100% consistent, but identical when it answers (the
+    `cmd09` byte is still `64`, the same byte the morning's boot prefix
+    carried); still LOCKED.
     - The deaf MCU is **not fully deaf**: poked WITHOUT a handshake (`poke`)
       it answers exactly `AA cmd08 00` + `AA cmd09 64` and nothing else
-      (`cmd02`/`cmd07`/`cmd12`/`cmd25`/`cmd30`/`cmd35` ignored) — the
-      identical 2-frame pair in both episodes.
+      (`cmd02`/`cmd07`/`cmd12`/`cmd25`/`cmd30`/`cmd35` ignored) — seen in
+      all three episodes (in the 11-20 11:11 episode, on 3 of 4 pokes).
     - A poke (our full E7 sequence + `cmd07` + `cmd12`) does **NOT** restore
-      the full command set, and 17.5 h of silence did not recover it either.
+      the full command set, and long silence did not recover it either
+      (17.5 h after the Nov 19 episode; ≥1.5 h after the Nov 20 one).
     - **Only observed recovery: a power cycle** (Nov 20 09:36:52 run: prefix,
       full session, state `01`, settings `03`). The 09:36:55 prefix was the
       user's power cycle (confirmed) — the prefix is sent **at power-on
