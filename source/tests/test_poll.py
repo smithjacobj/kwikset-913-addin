@@ -20,7 +20,7 @@ from kwikset_bench.modes.poll import poll
 
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
-    poll(McuFake(), seconds=22, interval=2, keepalive=2, hello_timeout=15)
+    poll(McuFake(), seconds=22, interval=2, keepalive=2, hello_timeout=15, after="cmd09")
 out = buf.getvalue()
 print(out)
 checks = {

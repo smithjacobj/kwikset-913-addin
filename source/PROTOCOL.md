@@ -124,8 +124,10 @@ rig had crossed wiring, the conclusion flips.
  user power-cycles the 913 (script already running)
 
  MCU  -> AA cmd18 00            hello
- MCU  -> AA cmd09 <boot byte>   retry prefix
-        (the pair re-sends every ~2.6 s, SEQ reset to 0x01, until answered)
+ MCU  -> AA cmd09 <boot byte>   no-answer nudge (sent only if the hello went
+                                unanswered -- bench form: role AA, ~0.5 s;
+                                old form: role E7, ~12 s; see note below)
+        (the prefix re-sends every ~2.6 s, SEQ reset to 0x01, until answered)
 
  WE   -> E7 cmd02  (readID)          SEQ 01
  WE   -> E7 cmd07  (status poll)     SEQ 02
@@ -147,12 +149,27 @@ rig had crossed wiring, the conclusion flips.
 ```
 
 - The MCU **initiates**; the module answers. Replies echo the request's SEQ.
-- The in-dialogue cmd09 reply is `46` on the bench board. The MCU-initiated
-  **boot** cmd09 byte varies: `3C` / `50` (unstable, low-battery boots),
-  `46` (low batteries), `64` (fresh batteries) — undecoded, no actuation
-  effect.
-- `manual`/`act`/`lock`/`unlock` all start from this handshake (`--hello-timeout`
-  covers slow/power-on boots; `--after hello` syncs on frame one only).
+- The in-dialogue cmd09 reply is `46` on the bench board (`5A` on the old
+  board, §9). The MCU-initiated **boot** cmd09 byte varies with battery
+  state: `3C` / `50` (unstable, low-battery boots), `46` (low batteries),
+  `64` (fresh batteries) — undecoded, no actuation effect.
+- **The boot cmd09 is a no-answer nudge, not an unconditional second
+  frame.** It is sent only when the hello went unanswered; answer the hello
+  promptly and the boot is **hello-alone** (zero cmd09 frames) and the MCU
+  goes straight into the session. **Bench-confirmed** (Nov 20 18:54:33
+  `poll --after hello`: one `AA cmd18`, zero `AA cmd09`, full 5-minute
+  session, 0 MISMATCH).
+- **The two nudge forms split by board** (Nov 20 sniffs, n=2 per board —
+  suggestive, not conclusive): the old board's nudge is **E7-role** (module
+  direction!) ~12 s after an unanswered hello; the bench board's is
+  **AA-role** ~0.5 s later. Both carried `64` (fresh batteries), and neither
+  board has shown the other's form. Consequence for the harness: `--after
+  hello` works on **both** revisions (the hello is present in both forms);
+  `--after cmd09` needs an **AA-role** cmd09 and times out on the old
+  (E7-form) boot.
+- `manual`/`act`/`lock`/`unlock` all start from this handshake
+  (`--hello-timeout` covers slow/power-on boots; `--after` defaults to
+  `hello`, §15).
 
 ## 6. Absolute actuation model
 
@@ -274,16 +291,22 @@ State **survives a power-cycle** (bolt position + MCU belief both persist).
 
 | Item | Capture board (`04 00 36 0D`) | Bench board (`08 00 45 01`) |
 |---|---|---|
+| part number | `SPECTRUM BRANDS-HHI 450-00017-001 Rev.` (silkscreen also `510-00017-001 Rev.1`) | `SPECTRUM BRANDS-HHI 510-00100-001 Rev.F` |
 | cmd02 ID blob | `04 00 36 0D` | `08 00 45 01` |
 | cmd07 readout | `00` | `01` locked / `02` unlocked |
 | in-dialogue cmd09 reply | `5A` (→ ~12.06 s prompt → `cmd4E` answer → `55 cmd4E 04`) | `46` (prompt never observed) |
-| boot cmd09 byte | — | varies `3C`/`50`/`46`/`64` (undecoded) |
+| boot cmd09 nudge | **E7-role**, ~12 s after an unanswered hello; `64` (fresh batteries) | **AA-role**, ~0.5 s after the hello; byte varies `3C`/`50`/`46`/`64` with battery state (undecoded) |
 | cmd35 reply | `16 × 0x20` | none |
 | cmd30 reply | `AA 01` | `55 03` |
 | motor-complete | `55 cmd2A 14`, ~10.5 s (fixed, incl. no-ops) | `55 cmd2A 15 FF`, ~3–4 s (absent in all 8 afternoon runs → confirm falls back to a fixed wait and still passes) |
 | echo-ack after complete | ~60 ms | flaky (2/8) |
 | low-battery behavior | — | `00` readout, skipped replies, or no boot prefix at all |
 | real Z-Wave module pairing | worked | **barebones** (§11) |
+
+The boot-nudge form (role + delay) is **board-correlated**: the four Nov 20
+sniffs (`logs/sniff_20261120_173820/173953/174422/174448.log`) split cleanly
+old → E7/+12 s, bench → AA/+0.5 s (n=2 per board — suggestive, not
+conclusive; §5).
 
 ## 10. Manual operation (key or thumbturn)
 
@@ -327,7 +350,8 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
 
 | Constant | Value | Context |
 |---|---|---|
-| hello retry period | ~2.6 s | MCU re-sends hello+cmd09, SEQ reset to `01` |
+| prefix retry period | ~2.6 s | MCU re-sends the prefix (hello + no-answer nudge), SEQ reset to `01`, until answered |
+| boot nudge delay | ~0.5 s (bench) / ~12 s (old) | after an unanswered hello, before the MCU's cmd09 nudge (§5) |
 | steady-state poll | ~2 s | our `cmd25` status report interval (configurable) |
 | motor-complete (bench) | ~3–4 s | after any state command |
 | motor-complete (capture) | ~10.5 s | fixed, including no-ops |
@@ -344,6 +368,12 @@ accepted our emulated module throughout) → **no effect on the DIY add-in.**
    capability bits (the real module's barebones rejection makes this a
    first-class question for future real-module compatibility).
 5. Boot cmd09 byte variants `3C`/`50`/`46`/`64` — battery state vs boot mode?
+   Held open: the **64-vs-5A reconciliation** — the boot nudge carries `64`
+   (both board forms, fresh batteries), while the old board's in-dialogue
+   cmd09 reply *and* the capture's ~12 s `E7 cmd09 5A` prompt are `5A`; the
+   prompt shares role and ~12 s timing with the old board's E7 boot nudge but
+   differs in data — same mechanism (data byte battery-dependent) or two
+   things?
 6. Does the MCU skip handshake replies (incl. in-dialogue cmd09) because of
    something in our request timing/content?
 7. `cmd35` no reply on bench; `cmd30` answered with role `55` on bench —
@@ -457,7 +487,9 @@ Subcommand behavior:
 | `poke` | NO handshake: N rounds of our E7 request sequence + `cmd07` + `cmd12` with a listen window between rounds — the deaf-state triage probe (bench 11-20: a deaf MCU answers `cmd08`/`cmd09` only, §14.12) |
 | `calibrate` / `verify` | CRC model against captures |
 
-Flags: `-p PORT`, `-v` (timestamps + CRC ok/BAD + raw), `--after hello|cmd09`,
+Flags: `-p PORT`, `-v` (timestamps + CRC ok/BAD + raw), `--after hello|cmd09`
+(default `hello` — frame one, works on both revisions; `cmd09` needs an
+AA-role nudge, so times out on the old E7-form boot),
 `--hello-timeout N`, `--with-poke` (all handshake modes: poke every 3 s while
 waiting for the prefix — for a lock that was NOT power-cycled; a cmd07 answer
 or a power-on prefix both start the session; on timeout the replies seen

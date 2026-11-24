@@ -53,7 +53,7 @@ def poke_round(s, seq, label="POKE"):
        "%s cmd12 settings seq=%02X" % (label, seq))
     return (seq + 1) & 0xFF
 
-def wait_prefix(s, timeout=15.0, after="cmd09", poke_interval=0.0):
+def wait_prefix(s, timeout=15.0, after="hello", poke_interval=0.0):
     """Wait for the 913's boot prefix. The MCU INITIATES: it transmits the hello
     (AA cmd18), then a cmd09 retry frame, and re-sends the pair every ~2.6 s
     (SEQ resets to 01) until it gets a valid module answer. Every frame is
@@ -102,7 +102,7 @@ def wait_prefix(s, timeout=15.0, after="cmd09", poke_interval=0.0):
             print("     the MCU answers cmd08/cmd09 only. Power-cycle the 913 to recover.")
     return (None, seq)
 
-def do_handshake(s, hello_timeout=15.0, after="cmd09", poke_interval=0.0):
+def do_handshake(s, hello_timeout=15.0, after="hello", poke_interval=0.0):
     """Corrected handshake: wait for the MCU's prefix, then transmit our E7
     request sequence. Returns the next free SEQ, or None if no prefix was seen
     (e.g. the enable pin is not driven High). With poke_interval > 0

@@ -36,10 +36,13 @@ REQ_ORDER = [0x02, 0x07, 0x08, 0x09, 0x35, 0x30]
 def e7_pairs(fake):
     return [(c, q) for (r, c, q) in fake.tx if r == 0xE7]
 
-def run(fake, **kw):
+def run(fake, after="cmd09", **kw):
+    # after is pinned to the full two-frame prefix: with the hello-sync default
+    # the boot cmd09 nudge would be left queued and drain mid-handshake (a
+    # MISMATCH line), shifting the output these checks calibrate against.
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        poll(fake, **kw)
+        poll(fake, after=after, **kw)
     return fake, buf.getvalue()
 
 def report(name, out, checks):

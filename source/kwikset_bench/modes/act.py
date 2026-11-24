@@ -148,7 +148,7 @@ def read_settings(s, seq, retries=2, per_retry=1.0):
     return None, seq
 
 def act(s, seconds=30, settle=8, mode="cluster", seqmode="track",
-        hello_timeout=15.0, after="cmd09", poll=2.0, roles="as-captured",
+        hello_timeout=15.0, after="hello", poll=2.0, roles="as-captured",
         frames=None, label=None, confirm_state=None, poke_interval=0.0):
     what = label if label is not None else (mode if frames is None else "subset %s" % frames)
     print("Act (corrected direction): handshake, then inject %s (roles=%s) after "

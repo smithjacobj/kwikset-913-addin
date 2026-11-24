@@ -26,7 +26,7 @@ from ..handshake import check_expected, do_handshake
 from ..link import log_frame, recv_frame, tx
 from ..protocol import REQS, ROLE_MCU_AX, ROLE_MOD, STEADY_REQ, fmt_data
 
-def manual(s, seconds=120, hello_timeout=15.0, after="cmd09", poll=2.0,
+def manual(s, seconds=120, hello_timeout=15.0, after="hello", poll=2.0,
            poke_interval=0.0):
     print("Manual-op capture: handshake, then listen %ds while you operate the lock by hand."
           % seconds)

@@ -26,7 +26,7 @@ from ..protocol import (ROLE_MOD, SETTINGS_MASK, STATE_WORDS, STEADY_REQ,
                         decode_settings, fmt_data, state_word)
 
 def poll(s, seconds=300, interval=5.0, keepalive=2.0, settings=False,
-         hello_timeout=15.0, after="cmd09", poke_interval=0.0):
+         hello_timeout=15.0, after="hello", poke_interval=0.0):
     print("State poll: handshake, then read state (cmd07) every %.1fs for %ds "
           "(cmd25 keepalive every %.1fs). Ctrl-C to stop." % (interval, seconds, keepalive))
     print("  Readout: 01=LOCKED 02=unlocked 00=unknown. Unknown/no-reply is treated")

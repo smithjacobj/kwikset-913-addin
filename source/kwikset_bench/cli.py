@@ -27,9 +27,10 @@ def main():
                        default=(120 if m=="manual" else 300 if m=="poll" else 30))
         p.add_argument("-v","--verbose",action="store_true",
                        help="log every frame: timestamp + CRC ok/BAD (+ raw unframed bytes)")
-        p.add_argument("--after",choices=["hello","cmd09"],default="cmd09",
-                       help="handshake sync point: 'cmd09' = after the full prefix [default]; "
-                            "'hello' = after frame one")
+        p.add_argument("--after",choices=["hello","cmd09"],default="hello",
+                       help="handshake sync point: 'hello' = after frame one [default; works on "
+                            "both revisions]; 'cmd09' = after the full AA prefix (needs an "
+                            "AA-role cmd09 -- bench/AA-form only, times out on an E7-form boot)")
         p.add_argument("--hello-timeout",type=int,default=15,
                        help="seconds to wait for the 913's boot prefix before giving up")
         p.add_argument("--with-poke",action="store_true",

@@ -6,7 +6,7 @@ from ..handshake import check_expected, do_handshake
 from ..link import log_frame, recv_frame, tx
 from ..protocol import ROLE_MOD, STEADY_REQ, fmt_data
 
-def emulate(s, seconds=30, hello_timeout=15.0, after="cmd09", poll_every=2.0,
+def emulate(s, seconds=30, hello_timeout=15.0, after="hello", poll_every=2.0,
             poke_interval=0.0):
     print("Emulate (corrected direction): wait for the 913's prefix, send our E7 "
           "request sequence, then log its replies and send periodic cmd25 status "
